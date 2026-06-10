@@ -1,18 +1,18 @@
 name: update-hk-data
 
-  on:
+on:
     schedule:
       - cron: "0 12 * * 1-5"
     workflow_dispatch: {}
 
-  permissions:
+permissions:
     contents: write
 
-  concurrency:
+concurrency:
     group: update-hk-data
     cancel-in-progress: false
 
-  jobs:
+jobs:
     update:
       runs-on: ubuntu-latest
       timeout-minutes: 120
