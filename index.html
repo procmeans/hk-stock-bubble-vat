@@ -43,9 +43,10 @@
     <p id="stat" class="dim"></p>
   </div>
   <div id="legend">
-    <div class="row"><span class="swatch" style="background:#ff6b6b"></span>较前一日上涨</div>
-    <div class="row"><span class="swatch" style="background:#46d39a"></span>较前一日下跌</div>
-    <div class="row"><span class="swatch" style="background:#6b7a90"></span>亏损 / 无对比</div>
+    <div class="row"><span class="swatch" style="background:#ef5b25"></span>高 PE(贵 / 成长)</div>
+    <div class="row"><span class="swatch" style="background:#5bd94a"></span>中 PE</div>
+    <div class="row"><span class="swatch" style="background:#3f6fe0"></span>低 PE(便宜 / 价值)</div>
+    <div class="row"><span class="swatch" style="background:#6b7a90"></span>亏损(PE≤0)</div>
     <div class="row dim" style="margin-top:7px">⌖ 圆面积 ∝ 市值 · 高度 ∝ PE</div>
   </div>
   <canvas id="cv"></canvas>
@@ -54,14 +55,13 @@
     <button id="play">▶ 播放</button>
     <span id="date">—</span>
     <input id="slider" type="range" min="0" max="0" value="0" step="1">
-    <span id="mode">配色:日涨跌</span>
   </div>
   <div id="loading">正在加载数据…</div>
 </div>
 <script>
 const cv=document.getElementById('cv'), ctx=cv.getContext('2d'), tip=document.getElementById('tip');
 let W,H,dpr=Math.min(window.devicePixelRatio||1,2);
-let vat={}, nodes=[], byDate={}, dates=[], idx=0, colorMode='change', playing=false, timer=null;
+let vat={}, nodes=[], byDate={}, dates=[], idx=0, playing=false, timer=null;
 
 function computeVat(){
   W=innerWidth;H=innerHeight;
@@ -101,20 +101,9 @@ function buildScales(){
 function peToY(pe){ const ySedTop=vat.bot-(vat.bot-vat.rim)*0.20;
   return pe>0? yScale(Math.max(1,Math.min(150,pe))) : ySedTop+(vat.bot-ySedTop)*0.55; }
 
-function changeColor(p){ // p = 市值日变化比例,±4% 即接近满饱和
-  if(p==null) return '#6b7a90';
-  const g='#7d8aa0';
-  const t=Math.max(-1,Math.min(1,p/0.04));
-  if(t>=0) return d3.interpolateRgb(g,'#ff4d4d')(t);
-  return d3.interpolateRgb(g,'#2fd38f')(-t);
-}
-let frameHasChange=false;  // 当前这一天是否存在实质的日涨跌差异
+// 固定的静态配色:按 PE 高低冷→暖,亏损灰。天与天之间的变化通过气泡大小/高度的移动体现,颜色不做涨跌对比。
 function colorOf(n){
-  // 以下任一情况都按 PE 高低上色(保证有颜色):PE 模式 / 无前一日 / 当天整体没有涨跌差异
-  if(colorMode==='pe' || n.chg==null || !frameHasChange){
-    return n.loss?'#6b7a90':colScale(Math.log10(Math.max(1,Math.min(150,n.pe))));
-  }
-  return changeColor(n.chg);
+  return n.loss ? '#6b7a90' : colScale(Math.log10(Math.max(1,Math.min(150,n.pe))));
 }
 
 // ---- 切换日期:更新每个节点状态,再加热力导向自然移动 ----
@@ -130,9 +119,6 @@ function applyDate(initial){
     const p=prev&&prev.get(n.code);
     n.chg = p? (o.mc-p.mc)/p.mc : null;
   }
-  // 判断这一天是否存在实质涨跌差异(测试期同日重复快照会全为 0 → 回退 PE 配色)
-  let maxAbs=0; for(const n of nodes){ if(n.viz&&n.chg!=null) maxAbs=Math.max(maxAbs,Math.abs(n.chg)); }
-  frameHasChange = maxAbs>0.002;
   computeLabels();
   document.getElementById('date').textContent=dates[idx];
   document.getElementById('slider').value=idx;
@@ -219,12 +205,6 @@ function setupUI(){
   sl.max=dates.length-1; sl.value=dates.length-1;
   sl.oninput=()=>{ idx=+sl.value; applyDate(false); };
   document.getElementById('play').onclick=togglePlay;
-  // 只有 1 天数据时默认按 PE 高低上色(无从比较涨跌);≥2 天默认按日涨跌
-  colorMode = dates.length>=2 ? 'change' : 'pe';
-  const mode=document.getElementById('mode');
-  mode.textContent='配色:'+(colorMode==='change'?'日涨跌':'PE高低');
-  mode.onclick=()=>{ colorMode=colorMode==='change'?'pe':'change';
-    mode.textContent='配色:'+(colorMode==='change'?'日涨跌':'PE高低'); draw(); };
 }
 function togglePlay(){
   const btn=document.getElementById('play');
@@ -241,9 +221,9 @@ cv.addEventListener('mousemove',e=>{ const mx=e.clientX,my=e.clientY; let hit=nu
   for(const n of nodes){ if(!n.viz)continue; const dx=n.x-mx,dy=n.y-my,dd=dx*dx+dy*dy;
     if(dd<(n.r+2)*(n.r+2)&&dd<best){best=dd;hit=n;} }
   if(hit){ tip.style.display='block';tip.style.left=Math.min(mx+14,W-260)+'px';tip.style.top=(my+14)+'px';
-    const chgCls=hit.chg==null?'dim':(hit.chg>=0?'up':'down');
+    const chg = hit.chg==null? '' : ` <span class="dim">较前一日 ${fmtPct(hit.chg)}</span>`;
     tip.innerHTML=`<b>${hit.name}</b> <span class="dim">${hit.code}</span><br>`+
-      `市值:<b>${fmtMC(hit.mc)}</b> ${hit.cur} <span class="${chgCls}">${fmtPct(hit.chg)}</span><br>`+
+      `市值:<b>${fmtMC(hit.mc)}</b> ${hit.cur}${chg}<br>`+
       `PE(TTM):<span class="pe">${hit.pe}</span>${hit.pe<=0?' <span class="dim">(亏损)</span>':''}<br>`+
       `<span class="dim">营收 ${fmtBig(hit.rev)} · 净利 ${fmtBig(hit.profit)}</span>`;
   } else tip.style.display='none';
