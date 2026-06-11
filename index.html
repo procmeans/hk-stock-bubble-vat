@@ -67,8 +67,8 @@ function computeVat(){
   W=innerWidth;H=innerHeight;
   cv.width=W*dpr;cv.height=H*dpr;cv.style.width=W+'px';cv.style.height=H+'px';
   ctx.setTransform(dpr,0,0,dpr,0,0);
-  const padX=Math.max(80,W*0.10), top=118, bot=H-92;
-  vat={x0:padX,x1:W-padX,top,bot,rim:top+34}; vat.w=vat.x1-vat.x0;
+  const padX=Math.max(24,W*0.04), top=86, bot=H-74;
+  vat={x0:padX,x1:W-padX,top,bot,rim:top+30}; vat.w=vat.x1-vat.x0;
 }
 
 // ---- 数据加载 ----
@@ -109,8 +109,11 @@ function changeColor(p){ // p = 市值日变化比例
   return d3.interpolateRgb(g,'#3fd39a')(-t);
 }
 function colorOf(n){
-  if(colorMode==='pe'){ return n.loss?'#6b7a90':colScale(Math.log10(Math.max(1,Math.min(150,n.pe)))); }
-  return n.chg==null ? (n.loss?'#6b7a90':'#7d8aa0') : changeColor(n.chg);
+  // PE 配色,或「日涨跌」模式下当天没有可对比的前一日时,都回退到按 PE 高低上色
+  if(colorMode==='pe' || n.chg==null){
+    return n.loss?'#6b7a90':colScale(Math.log10(Math.max(1,Math.min(150,n.pe))));
+  }
+  return changeColor(n.chg);
 }
 
 // ---- 切换日期:更新每个节点状态,再加热力导向自然移动 ----
@@ -202,8 +205,12 @@ function setupUI(){
   sl.max=dates.length-1; sl.value=dates.length-1;
   sl.oninput=()=>{ idx=+sl.value; applyDate(false); };
   document.getElementById('play').onclick=togglePlay;
-  document.getElementById('mode').onclick=()=>{ colorMode=colorMode==='change'?'pe':'change';
-    document.getElementById('mode').textContent='配色:'+(colorMode==='change'?'日涨跌':'PE高低'); draw(); };
+  // 只有 1 天数据时默认按 PE 高低上色(无从比较涨跌);≥2 天默认按日涨跌
+  colorMode = dates.length>=2 ? 'change' : 'pe';
+  const mode=document.getElementById('mode');
+  mode.textContent='配色:'+(colorMode==='change'?'日涨跌':'PE高低');
+  mode.onclick=()=>{ colorMode=colorMode==='change'?'pe':'change';
+    mode.textContent='配色:'+(colorMode==='change'?'日涨跌':'PE高低'); draw(); };
 }
 function togglePlay(){
   const btn=document.getElementById('play');
