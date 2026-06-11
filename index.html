@@ -101,16 +101,17 @@ function buildScales(){
 function peToY(pe){ const ySedTop=vat.bot-(vat.bot-vat.rim)*0.20;
   return pe>0? yScale(Math.max(1,Math.min(150,pe))) : ySedTop+(vat.bot-ySedTop)*0.55; }
 
-function changeColor(p){ // p = 市值日变化比例
+function changeColor(p){ // p = 市值日变化比例,±4% 即接近满饱和
   if(p==null) return '#6b7a90';
   const g='#7d8aa0';
-  const t=Math.max(-1,Math.min(1,p/0.06));
-  if(t>=0) return d3.interpolateRgb(g,'#ff5b5b')(t);
-  return d3.interpolateRgb(g,'#3fd39a')(-t);
+  const t=Math.max(-1,Math.min(1,p/0.04));
+  if(t>=0) return d3.interpolateRgb(g,'#ff4d4d')(t);
+  return d3.interpolateRgb(g,'#2fd38f')(-t);
 }
+let frameHasChange=false;  // 当前这一天是否存在实质的日涨跌差异
 function colorOf(n){
-  // PE 配色,或「日涨跌」模式下当天没有可对比的前一日时,都回退到按 PE 高低上色
-  if(colorMode==='pe' || n.chg==null){
+  // 以下任一情况都按 PE 高低上色(保证有颜色):PE 模式 / 无前一日 / 当天整体没有涨跌差异
+  if(colorMode==='pe' || n.chg==null || !frameHasChange){
     return n.loss?'#6b7a90':colScale(Math.log10(Math.max(1,Math.min(150,n.pe))));
   }
   return changeColor(n.chg);
@@ -129,6 +130,9 @@ function applyDate(initial){
     const p=prev&&prev.get(n.code);
     n.chg = p? (o.mc-p.mc)/p.mc : null;
   }
+  // 判断这一天是否存在实质涨跌差异(测试期同日重复快照会全为 0 → 回退 PE 配色)
+  let maxAbs=0; for(const n of nodes){ if(n.viz&&n.chg!=null) maxAbs=Math.max(maxAbs,Math.abs(n.chg)); }
+  frameHasChange = maxAbs>0.002;
   computeLabels();
   document.getElementById('date').textContent=dates[idx];
   document.getElementById('slider').value=idx;
