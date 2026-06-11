@@ -129,6 +129,7 @@ function applyDate(initial){
     const p=prev&&prev.get(n.code);
     n.chg = p? (o.mc-p.mc)/p.mc : null;
   }
+  computeLabels();
   document.getElementById('date').textContent=dates[idx];
   document.getElementById('slider').value=idx;
   document.getElementById('stat').textContent=
@@ -136,8 +137,20 @@ function applyDate(initial){
   if(sim){ sim.alpha(initial?1:0.55).restart(); }
 }
 
-const labelN=30;
 function vizSorted(){ return nodes.filter(n=>n.viz).sort((a,b)=>b.mc-a.mc); }
+// 计算每个气泡能否在圈内放下名字:能放下就记字号 n.lf,字号自适应缩放,放不下则 lf=0
+function computeLabels(){
+  for(const n of nodes){
+    n.lf=0;
+    if(!n.viz || n.r<11) continue;
+    const nm=n.name.replace(/－.+$/,'');
+    let fs=Math.min(15, n.r*0.55);
+    ctx.font=fs+'px "PingFang SC","Microsoft YaHei",sans-serif';
+    const w=ctx.measureText(nm).width;
+    if(w > 2*n.r-6) fs *= (2*n.r-6)/w;   // 缩小以塞进圆内
+    if(fs>=7.5){ n.lf=fs; n.lname=nm; }   // 太小看不清就不显示
+  }
+}
 
 // ---- 力导向 ----
 let sim=null;
@@ -182,7 +195,6 @@ function drawGlass(){ const {x0,x1,top,bot}=vat;
   ctx.beginPath();ctx.moveTo(x0+18,top+30);ctx.lineTo(x0+18,bot-40);
   ctx.strokeStyle='rgba(255,255,255,0.12)';ctx.lineWidth=8;ctx.stroke();
 }
-let labelSet=new Set();
 function draw(){
   ctx.clearRect(0,0,W,H); drawVat();
   for(const n of nodes){ if(!n.viz||n.r<=0)continue;
@@ -191,16 +203,14 @@ function draw(){
     if(n.r>6){ctx.globalAlpha=0.5;ctx.lineWidth=0.8;ctx.strokeStyle='rgba(255,255,255,0.5)';ctx.stroke();}
     ctx.globalAlpha=1;
   }
-  ctx.fillStyle='rgba(255,255,255,0.92)';ctx.textAlign='center';ctx.textBaseline='middle';
-  for(const n of nodes){ if(n.viz&&labelSet.has(n.code)&&n.r>14){
-    ctx.font=`${Math.min(13,Math.max(9,n.r*0.42))}px sans-serif`;
-    ctx.fillText(n.name.replace(/－.+$/,''),n.x,n.y);} }
+  ctx.fillStyle='rgba(255,255,255,0.96)';ctx.textAlign='center';ctx.textBaseline='middle';
+  for(const n of nodes){ if(n.viz&&n.lf){ ctx.font=n.lf+'px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillText(n.lname,n.x,n.y);} }
   drawGlass();
 }
 
 // ---- UI ----
 function setupUI(){
-  labelSet=new Set(vizSorted().slice(0,labelN).map(n=>n.code));
   const sl=document.getElementById('slider');
   sl.max=dates.length-1; sl.value=dates.length-1;
   sl.oninput=()=>{ idx=+sl.value; applyDate(false); };
