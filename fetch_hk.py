@@ -1,26 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每天在 GitHub Actions 里运行:抓取全部港股 PE / 市值 / 营收 / 净利润,
-写入 data/<港时日期>.json,并更新 data/manifest.json。
+每天在 GitHub Actions 里运行:并发抓取全部港股 PE / 市值 / 营收 / 净利润,
+写入 data/<港时日期>.json 并更新 data/manifest.json。
 
-为安全起见:若抓到的有效记录 < MIN_OK,直接报错退出、不覆盖任何文件,
-避免某天接口被限流导致网页数据被一份空数据冲掉。
+效率:用线程池并发(默认 12 并发),把原来串行 ~100 分钟压到 ~10-15 分钟。
+正确性保护:
+  - 每次请求带重试 + 退避;
+  - 单只缺市值或 PE 则跳过(不写半条);
+  - 全量有效记录 < MIN_OK 视为被限流,直接报错退出、不覆盖任何文件。
+并发数可用环境变量 WORKERS 调整。
 """
 import json
 import os
 import time
+import threading
 import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import akshare as ak
 
 DATA_DIR = "data"
-MIN_OK = 1500  # 低于这个数量视为抓取失败
+MIN_OK = 1500
+WORKERS = int(os.environ.get("WORKERS", "12"))
 
 
-def with_retry(func, *args, retries=3, pause=1.0, **kwargs):
+def with_retry(func, *args, retries=4, pause=0.8, **kwargs):
     for i in range(retries):
         try:
             return func(*args, **kwargs)
@@ -37,7 +44,6 @@ def code_list():
         raise RuntimeError("stock_hk_spot 拉取失败")
     df = df.rename(columns={"中文名称": "名称"})[["代码", "名称"]]
     df = df.drop_duplicates("代码")
-    # 去掉「－Ｒ」人民币柜台(与港币柜台同公司)
     df = df[~df["名称"].astype(str).str.contains("－Ｒ")].reset_index(drop=True)
     return df
 
@@ -63,36 +69,57 @@ def last_val(symbol, indicator):
     return float(df["value"].iloc[-1])
 
 
+def fetch_one(code, name):
+    """抓单只;缺市值或 PE 返回 None(跳过)。"""
+    mc = last_val(code, "总市值")
+    pe = last_val(code, "市盈率(TTM)")
+    if mc is None or pe is None:
+        return None
+    rp = revenue_profit(code)
+    rev, prof = rp.get("rev"), rp.get("profit")
+    return {
+        "code": code, "name": name,
+        "pe": round(pe, 2), "mc": round(mc, 2),
+        "rev": None if rev is None or pd.isna(rev) else float(rev),
+        "profit": None if prof is None or pd.isna(prof) else float(prof),
+        "cur": "" if pd.isna(rp.get("cur", "")) else str(rp.get("cur", "")),
+    }
+
+
 def main():
     today = datetime.datetime.now(ZoneInfo("Asia/Hong_Kong")).strftime("%Y-%m-%d")
     codes = code_list()
-    print(f"[{today}] 待抓取 {len(codes)} 家", flush=True)
+    total = len(codes)
+    print(f"[{today}] 待抓取 {total} 家,并发 {WORKERS}", flush=True)
 
     recs = []
-    for i, (_, r) in enumerate(codes.iterrows(), 1):
-        code, name = str(r["代码"]), str(r["名称"])
-        rp = revenue_profit(code)
-        mc = last_val(code, "总市值")
-        pe = last_val(code, "市盈率(TTM)")
-        if mc is None or pe is None:
-            continue
-        rev = rp.get("rev")
-        prof = rp.get("profit")
-        recs.append({
-            "code": code, "name": name,
-            "pe": round(pe, 2), "mc": round(mc, 2),
-            "rev": None if rev is None or pd.isna(rev) else float(rev),
-            "profit": None if prof is None or pd.isna(prof) else float(prof),
-            "cur": "" if pd.isna(rp.get("cur", "")) else str(rp.get("cur", "")),
-        })
-        if i % 200 == 0:
-            print(f"  {i}/{len(codes)}  已收集 {len(recs)}", flush=True)
-        time.sleep(0.3)
+    done = 0
+    lock = threading.Lock()
+    t0 = time.time()
 
-    print(f"有效记录 {len(recs)} 家", flush=True)
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futs = {ex.submit(fetch_one, str(r["代码"]), str(r["名称"])): r["代码"]
+                for _, r in codes.iterrows()}
+        for fut in as_completed(futs):
+            rec = None
+            try:
+                rec = fut.result()
+            except Exception:
+                rec = None
+            with lock:
+                done += 1
+                if rec:
+                    recs.append(rec)
+                if done % 300 == 0:
+                    rate = done / max(1e-6, time.time() - t0)
+                    print(f"  {done}/{total}  有效 {len(recs)}  "
+                          f"{rate:.1f}/s  已用 {int(time.time()-t0)}s", flush=True)
+
+    print(f"有效记录 {len(recs)} 家,用时 {int(time.time()-t0)}s", flush=True)
     if len(recs) < MIN_OK:
         raise SystemExit(f"有效记录过少({len(recs)} < {MIN_OK}),疑似被限流,放弃写入")
 
+    recs.sort(key=lambda x: -x["mc"])
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(os.path.join(DATA_DIR, f"{today}.json"), "w", encoding="utf-8") as f:
         json.dump(recs, f, ensure_ascii=False)
