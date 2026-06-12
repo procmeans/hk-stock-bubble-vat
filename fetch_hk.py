@@ -149,10 +149,12 @@ def main():
     if len(recs) < MIN_OK:
         raise SystemExit(f"有效记录过少({len(recs)} < {MIN_OK}),疑似被限流,放弃写入")
 
+    from gics_map import sec_g_for_hk
     inds = industry_map()
     print(f"行业映射 {len(inds)} 条", flush=True)
     for r in recs:
         r["ind"] = inds.get(r["code"], "")
+        r["sec"], r["g"] = sec_g_for_hk(r["ind"], r["code"])
 
     recs.sort(key=lambda x: -x["mc"])
     os.makedirs(DATA_DIR, exist_ok=True)
