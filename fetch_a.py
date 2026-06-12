@@ -21,6 +21,8 @@ import pandas as pd
 import requests
 import akshare as ak
 
+from gics_map import sec_g_for_a
+
 DATA_DIR = "data"
 MIN_OK = 3000
 URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
@@ -125,6 +127,7 @@ def main():
             "cur": "CNY",
             "ind": "" if pd.isna(r.get("ind")) else str(r.get("ind")),
         })
+        recs[-1]["sec"], recs[-1]["g"] = sec_g_for_a(recs[-1]["ind"], recs[-1]["code"])
 
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(os.path.join(DATA_DIR, f"a-{today}.json"), "w", encoding="utf-8") as f:
