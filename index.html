@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>港股市值 · 估值气泡缸</title>
+<title>港股 / A股 · 估值气泡缸</title>
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
 <style>
   html,body{margin:0;height:100%;background:#0a0e1a;color:#e8eef7;
@@ -17,20 +17,25 @@
     background:rgba(15,22,40,.6);padding:11px 13px;border-radius:10px;border:1px solid rgba(255,255,255,.08)}
   #legend .row{display:flex;align-items:center;gap:8px;margin:4px 0}
   .swatch{width:12px;height:12px;border-radius:50%}
+  .ring{width:12px;height:12px;border-radius:50%;box-sizing:border-box;background:transparent}
   #tip{position:absolute;z-index:10;pointer-events:none;display:none;
     background:rgba(10,15,28,.96);border:1px solid rgba(120,160,220,.4);border-radius:8px;
-    padding:9px 12px;font-size:12.5px;line-height:1.6;box-shadow:0 6px 24px rgba(0,0,0,.5);max-width:250px}
+    padding:9px 12px;font-size:12.5px;line-height:1.6;box-shadow:0 6px 24px rgba(0,0,0,.5);max-width:260px}
   #tip b{font-size:14px;color:#fff}.dim{color:#8da2c0}.pe{color:#ffd27d}
-  .up{color:#ff6b6b}.down{color:#46d39a}
+  .badge{display:inline-block;padding:0 6px;border-radius:4px;font-size:11px;margin-left:6px;vertical-align:1px}
+  .badge.hk{background:rgba(90,200,250,.18);color:#5ac8fa;border:1px solid rgba(90,200,250,.45)}
+  .badge.a{background:rgba(255,159,67,.16);color:#ff9f43;border:1px solid rgba(255,159,67,.45)}
   #ctl{position:absolute;left:50%;transform:translateX(-50%);bottom:22px;z-index:6;
     background:rgba(15,22,40,.75);border:1px solid rgba(255,255,255,.1);border-radius:12px;
-    padding:10px 16px;display:flex;align-items:center;gap:14px;backdrop-filter:blur(6px)}
+    padding:10px 16px;display:flex;align-items:center;gap:14px;backdrop-filter:blur(6px);flex-wrap:wrap;justify-content:center}
   #ctl button{background:#2b3a55;color:#e8eef7;border:none;border-radius:7px;
     padding:6px 12px;font-size:13px;cursor:pointer}
   #ctl button:hover{background:#37496a}
+  #mkt{display:flex;gap:6px;padding-right:12px;border-right:1px solid rgba(255,255,255,.12)}
+  #mkt button{background:transparent;color:#9fb4d4;border:1px solid transparent}
+  #mkt button.on{background:#2b3a55;color:#fff;border-color:rgba(140,180,240,.35)}
   #date{font-variant-numeric:tabular-nums;font-size:14px;font-weight:600;min-width:96px;text-align:center}
-  #slider{width:min(46vw,520px)}
-  #mode{font-size:12px;cursor:pointer;color:#9fb4d4;user-select:none}
+  #slider{width:min(38vw,440px)}
   #loading{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
     z-index:20;font-size:15px;color:#9fb4d4;background:#0a0e1a}
 </style>
@@ -38,8 +43,8 @@
 <body>
 <div id="wrap">
   <div id="hd">
-    <h1>港股市值 · 估值气泡缸</h1>
-    <p>气泡大小 = 总市值 &nbsp;|&nbsp; 越往上 PE 越高(越贵),缸底灰色为亏损股</p>
+    <h1 id="title">港股市值 · 估值气泡缸</h1>
+    <p>气泡大小 = 总市值(统一折算美元) &nbsp;|&nbsp; 越往上 PE 越高(越贵),缸底灰色为亏损股</p>
     <p id="stat" class="dim"></p>
   </div>
   <div id="legend">
@@ -47,11 +52,21 @@
     <div class="row"><span class="swatch" style="background:#5bd94a"></span>中 PE</div>
     <div class="row"><span class="swatch" style="background:#3f6fe0"></span>低 PE(便宜 / 价值)</div>
     <div class="row"><span class="swatch" style="background:#6b7a90"></span>亏损(PE≤0)</div>
-    <div class="row dim" style="margin-top:7px">⌖ 圆面积 ∝ 市值 · 高度 ∝ PE</div>
+    <div class="row dim">⌖ 圆面积 ∝ 市值 · 高度 ∝ PE</div>
+    <div class="row dim" style="max-width:185px">市值统一折算:1 USD =<br>7.80 HKD = 7.15 CNY</div>
+    <div id="mixrows" style="display:none">
+      <div class="row"><span class="ring" style="border:2.5px solid #5ac8fa"></span>港股(描边)</div>
+      <div class="row"><span class="ring" style="border:2.5px solid #ff9f43"></span>A股(描边)</div>
+    </div>
   </div>
   <canvas id="cv"></canvas>
   <div id="tip"></div>
   <div id="ctl">
+    <div id="mkt">
+      <button data-mode="hk" class="on">港股</button>
+      <button data-mode="a">A股</button>
+      <button data-mode="both">港股 + A股</button>
+    </div>
     <button id="play">▶ 播放</button>
     <span id="date">—</span>
     <input id="slider" type="range" min="0" max="0" value="0" step="1">
@@ -61,25 +76,43 @@
 <script>
 const cv=document.getElementById('cv'), ctx=cv.getContext('2d'), tip=document.getElementById('tip');
 let W,H,dpr=Math.min(window.devicePixelRatio||1,2);
-let vat={}, nodes=[], byDate={}, dates=[], idx=0, playing=false, timer=null;
+let vat={}, nodes=[], dates=[], idx=0, playing=false, timer=null;
+let mode='hk';                                  // 'hk' | 'a' | 'both'  默认港股
+const byDate={HK:{}, A:{}};                     // byDate[mkt][date] = Map(code -> rec)
+const USD_PER={HK:1/7.80, A:1/7.15};            // 市值折算成美元(亿)
+const TITLES={hk:'港股市值 · 估值气泡缸', a:'A股市值 · 估值气泡缸', both:'港股 + A股 · 估值气泡缸'};
+const inMode=n=> mode==='both' || (mode==='hk' ? n.mkt==='HK' : n.mkt==='A');
 
 function computeVat(){
   W=innerWidth;H=innerHeight;
   cv.width=W*dpr;cv.height=H*dpr;cv.style.width=W+'px';cv.style.height=H+'px';
   ctx.setTransform(dpr,0,0,dpr,0,0);
-  const padX=Math.max(24,W*0.04), top=86, bot=H-74;
+  // 顶部留出标题区(标题+两行说明约 105px),再加缸口椭圆半高,避免文字压在缸口上
+  const padX=Math.max(24,W*0.04), top=168, bot=H-86;
   vat={x0:padX,x1:W-padX,top,bot,rim:top+30}; vat.w=vat.x1-vat.x0;
 }
 
 // ---- 数据加载 ----
+async function loadManifest(path){
+  try{ const r=await fetch(path+'?t='+Date.now()); if(!r.ok) return [];
+    return (await r.json()).dates||[]; }catch(e){ return []; }
+}
 async function load(){
-  const man=await (await fetch('data/manifest.json?t='+Date.now())).json();
-  dates=man.dates.slice(-90);            // 最多保留最近 90 天
-  const arrs=await Promise.all(dates.map(d=>fetch('data/'+d+'.json').then(r=>r.json())));
-  dates.forEach((d,i)=>{ byDate[d]=new Map(arrs[i].map(o=>[o.code,o])); });
-  // 全部出现过的公司并集做节点
+  const [hkDates,aDates]=await Promise.all([
+    loadManifest('data/manifest.json'), loadManifest('data/manifest_a.json')]);
+  dates=[...new Set([...hkDates,...aDates])].sort().slice(-90);   // 两市日期并集,最多 90 天
+  if(!dates.length) throw '无可用数据';
+  const jobs=[];
+  for(const d of dates){
+    if(hkDates.includes(d)) jobs.push(fetch('data/'+d+'.json').then(r=>r.json()).then(a=>{byDate.HK[d]=new Map(a.map(o=>[o.code,o]));}).catch(()=>{}));
+    if(aDates.includes(d))  jobs.push(fetch('data/a-'+d+'.json').then(r=>r.json()).then(a=>{byDate.A[d]=new Map(a.map(o=>[o.code,o]));}).catch(()=>{}));
+  }
+  await Promise.all(jobs);
+  // 全部出现过的公司并集做节点,key = 市场 + 代码
   const seen=new Map();
-  arrs.flat().forEach(o=>{ if(!seen.has(o.code)) seen.set(o.code,{code:o.code,name:o.name}); });
+  for(const mkt of ['HK','A']) for(const d in byDate[mkt])
+    byDate[mkt][d].forEach((o,code)=>{ const k=mkt+'|'+code;
+      if(!seen.has(k)) seen.set(k,{mkt,code,name:o.name}); });
   nodes=[...seen.values()];
   computeVat();
   nodes.forEach(n=>{ n.x=(vat.x0+vat.x1)/2+(Math.random()-0.5)*vat.w*0.8; n.y=vat.rim+Math.random()*(vat.bot-vat.rim); });
@@ -89,46 +122,61 @@ async function load(){
   startSim();
 }
 
-// ---- 比例尺(随窗口/数据重算) ----
+// ---- 比例尺 ----
 let rScale, yScale, colScale;
 function buildScales(){
-  const allMC=[]; Object.values(byDate).forEach(m=>m.forEach(o=>allMC.push(o.mc)));
-  rScale=d3.scaleSqrt().domain([0,d3.max(allMC)]).range([1.8,52]);
+  // 当前模式涉及的市场,跨全部日期取最大美元市值 -> 同一模式内气泡大小跨日期可比
+  const allMC=[];
+  for(const mkt of ['HK','A']){
+    if(mode==='hk'&&mkt==='A') continue;
+    if(mode==='a'&&mkt==='HK') continue;
+    for(const d in byDate[mkt]) byDate[mkt][d].forEach(o=>allMC.push(o.mc*USD_PER[mkt]));
+  }
+  rScale=d3.scaleSqrt().domain([0,d3.max(allMC)]).range([1.8, mode==='both'?46:52]);
   const peLo=1,peHi=150, yTop=vat.rim+40, ySedTop=vat.bot-(vat.bot-vat.rim)*0.20;
   yScale=d3.scaleLog().domain([peLo,peHi]).range([ySedTop-20,yTop]).clamp(true);
   colScale=d3.scaleSequential(t=>d3.interpolateTurbo(0.12+0.78*t)).domain([Math.log10(1),Math.log10(150)]);
 }
 function peToY(pe){ const ySedTop=vat.bot-(vat.bot-vat.rim)*0.20;
   return pe>0? yScale(Math.max(1,Math.min(150,pe))) : ySedTop+(vat.bot-ySedTop)*0.55; }
-
-// 固定的静态配色:按 PE 高低冷→暖,亏损灰。天与天之间的变化通过气泡大小/高度的移动体现,颜色不做涨跌对比。
 function colorOf(n){
   return n.loss ? '#6b7a90' : colScale(Math.log10(Math.max(1,Math.min(150,n.pe))));
 }
 
-// ---- 切换日期:更新每个节点状态,再加热力导向自然移动 ----
+// ---- 切换日期 / 模式:更新每个节点状态,再加热力导向自然移动 ----
 function applyDate(initial){
   buildScales();
-  const cur=byDate[dates[idx]], prev= idx>0? byDate[dates[idx-1]] : null;
-  let nViz=0,nLoss=0;
+  const date=dates[idx];
+  let nViz=0,nLoss=0,nHK=0;
   for(const n of nodes){
-    const o=cur.get(n.code);
-    if(!o){ n.viz=false; n.r=0; continue; }
-    n.viz=true; nViz++; n.pe=o.pe; n.mc=o.mc; n.rev=o.rev; n.profit=o.profit; n.cur=o.cur; n.name=o.name;
-    n.r=rScale(o.mc); n.ty=peToY(o.pe); n.loss=o.pe<=0; if(n.loss)nLoss++;
-    const p=prev&&prev.get(n.code);
+    const cur=byDate[n.mkt][date], o=cur&&cur.get(n.code);
+    if(!o||!inMode(n)){ n.viz=false; n.r=0; continue; }
+    n.viz=true; nViz++; if(n.mkt==='HK')nHK++;
+    n.pe=o.pe; n.mc=o.mc; n.rev=o.rev; n.profit=o.profit; n.cur=o.cur; n.name=o.name;
+    n.mcUSD=o.mc*USD_PER[n.mkt];
+    n.r=rScale(n.mcUSD); n.ty=peToY(o.pe); n.loss=o.pe<=0; if(n.loss)nLoss++;
+    const prev= idx>0 ? byDate[n.mkt][dates[idx-1]] : null, p=prev&&prev.get(n.code);
     n.chg = p? (o.mc-p.mc)/p.mc : null;
   }
   computeLabels();
-  document.getElementById('date').textContent=dates[idx];
+  document.getElementById('date').textContent=date;
   document.getElementById('slider').value=idx;
-  document.getElementById('stat').textContent=
-    `${dates[idx]}  ·  共 ${nViz} 家  ·  盈利 ${nViz-nLoss}  ·  亏损 ${nLoss}`;
+  document.getElementById('title').textContent=TITLES[mode];
+  document.getElementById('mixrows').style.display = mode==='both' ? '' : 'none';
+  let s=`${date}  ·  共 ${nViz} 家  ·  盈利 ${nViz-nLoss}  ·  亏损 ${nLoss}`;
+  if(mode==='both') s+=`  ·  港股 ${nHK} / A股 ${nViz-nHK}`;
+  if(nViz===0) s=`${date}  ·  该日暂无${mode==='a'?'A股':''}数据`;
+  document.getElementById('stat').textContent=s;
   if(sim){ sim.alpha(initial?1:0.55).restart(); }
 }
+function setMode(m){
+  mode=m;
+  document.querySelectorAll('#mkt button').forEach(b=>b.classList.toggle('on',b.dataset.mode===m));
+  applyDate(false);
+  if(sim) sim.alpha(0.9).restart();
+}
 
-function vizSorted(){ return nodes.filter(n=>n.viz).sort((a,b)=>b.mc-a.mc); }
-// 计算每个气泡能否在圈内放下名字:能放下就记字号 n.lf,字号自适应缩放,放不下则 lf=0
+// 计算每个气泡能否在圈内放下名字:能放下就记字号 n.lf,放不下则 lf=0
 function computeLabels(){
   for(const n of nodes){
     n.lf=0;
@@ -137,8 +185,8 @@ function computeLabels(){
     let fs=Math.min(15, n.r*0.55);
     ctx.font=fs+'px "PingFang SC","Microsoft YaHei",sans-serif';
     const w=ctx.measureText(nm).width;
-    if(w > 2*n.r-6) fs *= (2*n.r-6)/w;   // 缩小以塞进圆内
-    if(fs>=7.5){ n.lf=fs; n.lname=nm; }   // 太小看不清就不显示
+    if(w > 2*n.r-6) fs *= (2*n.r-6)/w;
+    if(fs>=7.5){ n.lf=fs; n.lname=nm; }
   }
 }
 
@@ -187,10 +235,18 @@ function drawGlass(){ const {x0,x1,top,bot}=vat;
 }
 function draw(){
   ctx.clearRect(0,0,W,H); drawVat();
+  const mix = mode==='both';
   for(const n of nodes){ if(!n.viz||n.r<=0)continue;
     ctx.beginPath();ctx.arc(n.x,n.y,n.r,0,Math.PI*2);
     ctx.fillStyle=colorOf(n);ctx.globalAlpha=n.loss?0.55:0.82;ctx.fill();
-    if(n.r>6){ctx.globalAlpha=0.5;ctx.lineWidth=0.8;ctx.strokeStyle='rgba(255,255,255,0.5)';ctx.stroke();}
+    if(n.r>5){
+      ctx.globalAlpha = mix?0.85:0.5;
+      ctx.lineWidth = mix?1.4:0.8;
+      // 同缸模式用描边色区分市场:港股蓝、A股橙
+      ctx.strokeStyle = mix ? (n.mkt==='HK'?'rgba(90,200,250,0.95)':'rgba(255,159,67,0.95)')
+                            : 'rgba(255,255,255,0.5)';
+      ctx.stroke();
+    }
     ctx.globalAlpha=1;
   }
   ctx.fillStyle='rgba(255,255,255,0.96)';ctx.textAlign='center';ctx.textBaseline='middle';
@@ -205,6 +261,9 @@ function setupUI(){
   sl.max=dates.length-1; sl.value=dates.length-1;
   sl.oninput=()=>{ idx=+sl.value; applyDate(false); };
   document.getElementById('play').onclick=togglePlay;
+  document.querySelectorAll('#mkt button').forEach(b=>{
+    b.onclick=()=>{ if(b.dataset.mode!==mode) setMode(b.dataset.mode); };
+  });
 }
 function togglePlay(){
   const btn=document.getElementById('play');
@@ -220,12 +279,14 @@ function togglePlay(){
 cv.addEventListener('mousemove',e=>{ const mx=e.clientX,my=e.clientY; let hit=null,best=1e9;
   for(const n of nodes){ if(!n.viz)continue; const dx=n.x-mx,dy=n.y-my,dd=dx*dx+dy*dy;
     if(dd<(n.r+2)*(n.r+2)&&dd<best){best=dd;hit=n;} }
-  if(hit){ tip.style.display='block';tip.style.left=Math.min(mx+14,W-260)+'px';tip.style.top=(my+14)+'px';
+  if(hit){ tip.style.display='block';tip.style.left=Math.min(mx+14,W-270)+'px';tip.style.top=(my+14)+'px';
+    const badge = hit.mkt==='HK' ? '<span class="badge hk">港股</span>' : '<span class="badge a">A股</span>';
+    const mcCur = hit.mkt==='HK' ? 'HKD' : 'CNY';
     const chg = hit.chg==null? '' : ` <span class="dim">较前一日 ${fmtPct(hit.chg)}</span>`;
-    tip.innerHTML=`<b>${hit.name}</b> <span class="dim">${hit.code}</span><br>`+
-      `市值:<b>${fmtMC(hit.mc)}</b> ${hit.cur}${chg}<br>`+
+    tip.innerHTML=`<b>${hit.name}</b> <span class="dim">${hit.code}</span>${badge}<br>`+
+      `市值:<b>${fmtMC(hit.mcUSD)}</b> USD <span class="dim">(${fmtMC(hit.mc)} ${mcCur})</span>${chg}<br>`+
       `PE(TTM):<span class="pe">${hit.pe}</span>${hit.pe<=0?' <span class="dim">(亏损)</span>':''}<br>`+
-      `<span class="dim">营收 ${fmtBig(hit.rev)} · 净利 ${fmtBig(hit.profit)}</span>`;
+      `<span class="dim">营收 ${fmtBig(hit.rev)} · 净利 ${fmtBig(hit.profit)} ${hit.cur||''}</span>`;
   } else tip.style.display='none';
 });
 cv.addEventListener('mouseleave',()=>tip.style.display='none');
