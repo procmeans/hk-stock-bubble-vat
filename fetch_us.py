@@ -19,6 +19,8 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from gics_map import sec_g_for_us
+
 DATA_DIR = "data"
 MIN_OK = 3000
 MIN_MC = 1e8  # 1 亿美元以下的微型股不要
@@ -42,8 +44,29 @@ def fetch_page(page, retries=4, pause=1.0):
     return None
 
 
+def nasdaq_industry_map():
+    """纳斯达克官方 screener:全美股 symbol -> 细分行业(英文),一次请求。失败返回空表。"""
+    for i in range(4):
+        try:
+            r = requests.get(
+                "https://api.nasdaq.com/api/screener/stocks",
+                params={"tableonly": "true", "limit": 25, "download": "true"},
+                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+                         "Accept": "application/json, text/plain, */*",
+                         "Origin": "https://www.nasdaq.com", "Referer": "https://www.nasdaq.com/"},
+                timeout=30)
+            rows = r.json()["data"]["rows"]
+            return {row["symbol"]: (row.get("industry") or "").strip() for row in rows}
+        except Exception:
+            time.sleep(2 * (i + 1))
+    print("纳斯达克行业表拉取失败,二级行业按大类缺省值回退", flush=True)
+    return {}
+
+
 def main():
     today = datetime.datetime.now(ZoneInfo("Asia/Hong_Kong")).strftime("%Y-%m-%d")
+    nas = nasdaq_industry_map()
+    print(f"纳斯达克行业表 {len(nas)} 条", flush=True)
     recs, seen = [], set()
     page, total = 1, None
     while True:
@@ -61,12 +84,16 @@ def main():
             if not isinstance(pe, (int, float)):
                 continue
             seen.add(code)
-            ind = row.get("f100")
+            em_sec = row.get("f100")
+            em_sec = em_sec if isinstance(em_sec, str) and em_sec != "-" else ""
+            # 纳斯达克的 A/B 类股代码用 . 或 /(东财用 _),做变体匹配
+            nind = nas.get(code) or nas.get(code.replace("_", ".")) or nas.get(code.replace("_", "/")) or ""
+            sec, g = sec_g_for_us(em_sec, nind, code)
             recs.append({
                 "code": code, "name": name,
                 "pe": round(float(pe), 2), "mc": round(mc / 1e8, 2),  # 亿美元
                 "rev": None, "profit": None, "cur": "USD",
-                "ind": ind if isinstance(ind, str) and ind != "-" else "",
+                "ind": nind, "sec": sec, "g": g,
             })
         if page % 20 == 0:
             print(f"  第 {page} 页,累计有效 {len(recs)}", flush=True)
