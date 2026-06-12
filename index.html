@@ -101,9 +101,40 @@ const MKT_LABEL={HK:'港股', A:'A股', US:'美股'};
 const MKT_CUR={HK:'HKD', A:'CNY', US:'USD'};
 const MIX_STROKE={HK:'rgba(90,200,250,0.95)', A:'rgba(255,159,67,0.95)', US:'rgba(192,132,252,0.95)'};
 const inMode=n=> MKTS[mode].includes(n.mkt);
-let industry='all';                              // 行业筛选,'all' = 全部
+let industry='all';                              // 行业筛选:'all' | 'S:大类' | 'I:细分行业'
 const indOf=o=> o.ind || '未分类';
-const inIndustry=o=> industry==='all' || indOf(o)===industry;
+// 统一行业大类(以 GICS 11 大类为准,美股原生即此口径;港股/A股细分行业映射过去)
+const SECTORS=['信息技术','通讯服务','医疗保健','金融','可选消费','日常消费','工业','能源','原材料','公用事业','房地产'];
+const SEC_MAP={
+US:{'非日常生活消费品':'可选消费','日常消费品':'日常消费'},
+HK:{'软件服务':'信息技术','资讯科技器材':'信息技术','半导体':'信息技术',
+'电讯':'通讯服务','媒体及娱乐':'通讯服务',
+'药品及生物科技':'医疗保健','其他医疗保健':'医疗保健',
+'银行':'金融','保险':'金融','其他金融':'金融',
+'专业零售':'可选消费','家庭电器及用品':'可选消费','旅游及消闲设施':'可选消费','汽车':'可选消费','纺织及服饰':'可选消费',
+'食物饮品':'日常消费','消费者主要零售商':'日常消费','农业产品':'日常消费',
+'工业工程':'工业','工用支援':'工业','工用运输':'工业','建筑':'工业','支援服务':'工业','综合企业':'工业',
+'石油及天然气':'能源','煤炭':'能源',
+'一般金属及矿石':'原材料','原材料':'原材料','黄金及贵金属':'原材料',
+'公用事业':'公用事业','地产':'房地产'},
+A:{'IT服务Ⅱ':'信息技术','元件':'信息技术','光学光电子':'信息技术','其他电子Ⅱ':'信息技术','半导体':'信息技术','消费电子':'信息技术','电子化学品Ⅱ':'信息技术','计算机设备':'信息技术','软件开发':'信息技术','通信设备':'信息技术',
+'通信服务':'通讯服务','游戏Ⅱ':'通讯服务','数字媒体':'通讯服务','广告营销':'通讯服务','影视院线':'通讯服务','出版':'通讯服务','电视广播Ⅱ':'通讯服务',
+'中药Ⅱ':'医疗保健','化学制药':'医疗保健','医疗器械':'医疗保健','医疗服务':'医疗保健','医疗美容':'医疗保健','医药商业':'医疗保健','生物制品':'医疗保健','动物保健Ⅱ':'医疗保健',
+'保险Ⅱ':'金融','多元金融':'金融','证券Ⅱ':'金融','银行Ⅱ':'金融',
+'一般零售':'可选消费','专业连锁Ⅱ':'可选消费','乘用车':'可选消费','互联网电商':'可选消费','体育Ⅱ':'可选消费','家居用品':'可选消费','家电零部件Ⅱ':'可选消费','小家电':'可选消费','厨卫电器':'可选消费','白色家电':'可选消费','黑色家电':'可选消费','其他家电Ⅱ':'可选消费','照明设备Ⅱ':'可选消费','摩托车及其他':'可选消费','教育':'可选消费','文娱用品':'可选消费','旅游及景区':'可选消费','旅游零售Ⅱ':'可选消费','服装家纺':'可选消费','纺织制造':'可选消费','汽车服务':'可选消费','汽车零部件':'可选消费','酒店餐饮':'可选消费','饰品':'可选消费',
+'个护用品':'日常消费','休闲食品':'日常消费','农产品加工':'日常消费','农业综合Ⅱ':'日常消费','养殖业':'日常消费','种植业':'日常消费','渔业':'日常消费','白酒Ⅱ':'日常消费','非白酒':'日常消费','食品加工':'日常消费','饮料乳品':'日常消费','调味发酵品Ⅱ':'日常消费','饲料':'日常消费','化妆品':'日常消费',
+'专业工程':'工业','专业服务':'工业','专用设备':'工业','通用设备':'工业','工程机械':'工业','自动化设备':'工业','轨交设备Ⅱ':'工业','航天装备Ⅱ':'工业','航空装备Ⅱ':'工业','航海装备Ⅱ':'工业','地面兵装Ⅱ':'工业','军工电子Ⅱ':'工业','基础建设':'工业','房屋建设Ⅱ':'工业','装修装饰Ⅱ':'工业','工程咨询服务Ⅱ':'工业','物流':'工业','航空机场':'工业','航运港口':'工业','铁路公路':'工业','商用车':'工业','电机Ⅱ':'工业','电池':'工业','光伏设备':'工业','风电设备':'工业','电网设备':'工业','其他电源设备Ⅱ':'工业','环保设备Ⅱ':'工业','环境治理':'工业','综合Ⅱ':'工业','贸易Ⅱ':'工业',
+'煤炭开采':'能源','焦炭Ⅱ':'能源','油气开采Ⅱ':'能源','油服工程':'能源','炼化及贸易':'能源',
+'化学制品':'原材料','化学原料':'原材料','化学纤维':'原材料','农化制品':'原材料','塑料':'原材料','橡胶':'原材料','普钢':'原材料','特钢Ⅱ':'原材料','冶钢原料':'原材料','工业金属':'原材料','小金属':'原材料','能源金属':'原材料','贵金属':'原材料','金属新材料':'原材料','非金属材料Ⅱ':'原材料','水泥':'原材料','玻璃玻纤':'原材料','装修建材':'原材料','造纸':'原材料','林业Ⅱ':'原材料','包装印刷':'原材料',
+'电力':'公用事业','燃气Ⅱ':'公用事业',
+'房地产开发':'房地产','房地产服务':'房地产'}};
+const sectorOf=(mkt,o)=>{
+  if(!o.ind) return '未分类';
+  return SEC_MAP[mkt][o.ind] || (mkt==='US'&&SECTORS.includes(o.ind) ? o.ind : '其他');
+};
+const inIndustry=(mkt,o)=> industry==='all'
+  || (industry[0]==='S' && sectorOf(mkt,o)===industry.slice(2))
+  || (industry[0]==='I' && indOf(o)===industry.slice(2));
 // 该日期在当前模式下有没有数据(各市更新时间不同,日期并集里会有单边空缺);同缸模式要求所含市场当天都有
 const hasData=d=> MKTS[mode].every(m=>!!byDate[m][d]);
 function latestIdxWithData(){
@@ -134,9 +165,11 @@ async function load(){
   if(!dates.length) throw '无可用数据';
   const jobs=[];
   for(const d of dates){
-    if(hkDates.includes(d)) jobs.push(fetch('data/'+d+'.json').then(r=>r.json()).then(a=>{byDate.HK[d]=new Map(a.map(o=>[o.code,o]));}).catch(()=>{}));
-    if(aDates.includes(d))  jobs.push(fetch('data/a-'+d+'.json').then(r=>r.json()).then(a=>{byDate.A[d]=new Map(a.map(o=>[o.code,o]));}).catch(()=>{}));
-    if(usDates.includes(d)) jobs.push(fetch('data/us-'+d+'.json').then(r=>r.json()).then(a=>{byDate.US[d]=new Map(a.map(o=>[o.code,o]));}).catch(()=>{}));
+    // 带时间戳防缓存:数据文件当天会被重写(行情更新/字段补充),否则浏览器拿旧缓存
+    const t='?t='+Date.now();
+    if(hkDates.includes(d)) jobs.push(fetch('data/'+d+'.json'+t).then(r=>r.json()).then(a=>{byDate.HK[d]=new Map(a.map(o=>[o.code,o]));}).catch(()=>{}));
+    if(aDates.includes(d))  jobs.push(fetch('data/a-'+d+'.json'+t).then(r=>r.json()).then(a=>{byDate.A[d]=new Map(a.map(o=>[o.code,o]));}).catch(()=>{}));
+    if(usDates.includes(d)) jobs.push(fetch('data/us-'+d+'.json'+t).then(r=>r.json()).then(a=>{byDate.US[d]=new Map(a.map(o=>[o.code,o]));}).catch(()=>{}));
   }
   await Promise.all(jobs);
   // 全部出现过的公司并集做节点,key = 市场 + 代码
@@ -166,7 +199,7 @@ function buildScales(){
   const allMC=[], allPE=[];
   for(const mkt of MKTS[mode]){
     for(const d in byDate[mkt]) byDate[mkt][d].forEach(o=>{
-      if(!inIndustry(o)) return;                 // 行业筛选时刻度只看同行业,放大组内差异
+      if(!inIndustry(mkt,o)) return;             // 行业筛选时刻度只看同行业,放大组内差异
       allMC.push(o.mc*USD_PER[mkt]); if(o.pe>0) allPE.push(o.pe); });
   }
   if(!allMC.length) return;                      // 该行业无数据,保持旧刻度(此时无可见气泡)
@@ -196,7 +229,7 @@ function applyDate(initial){
   let nViz=0,nLoss=0; const byMkt={HK:0,A:0,US:0};
   for(const n of nodes){
     const cur=byDate[n.mkt][date], o=cur&&cur.get(n.code);
-    if(!o||!inMode(n)||!inIndustry(o)){ n.viz=false; n.r=0; continue; }
+    if(!o||!inMode(n)||!inIndustry(n.mkt,o)){ n.viz=false; n.r=0; continue; }
     n.viz=true; nViz++; byMkt[n.mkt]++;
     n.pe=o.pe; n.mc=o.mc; n.rev=o.rev; n.profit=o.profit; n.cur=o.cur; n.name=o.name; n.ind=o.ind||'';
     n.mcUSD=o.mc*USD_PER[n.mkt];
@@ -210,7 +243,7 @@ function applyDate(initial){
   document.getElementById('title').textContent=TITLES[mode];
   document.getElementById('mixrows').style.display = mode==='all' ? '' : 'none';
   let s=`${date}  ·  共 ${nViz} 家  ·  盈利 ${nViz-nLoss}  ·  亏损 ${nLoss}`;
-  if(industry!=='all') s+=`  ·  ${industry}`;
+  if(industry!=='all') s+=`  ·  ${industry.slice(2)}`;
   if(mode==='all') s+=`  ·  `+MKTS.all.map(m=>`${MKT_LABEL[m]} ${byMkt[m]}`).join(' / ');
   if(nViz===0) s=`${date}  ·  该日暂无数据`;
   document.getElementById('stat').textContent=s;
@@ -227,19 +260,26 @@ function setMode(m){
   if(sim) sim.alpha(0.9).restart();
 }
 
-// 行业下拉:统计当前模式各行业公司数(取各市场最近一天),按数量排序
+// 行业下拉:大类(三市场统一口径)+ 细分行业(当前模式),各按公司数排序
 function buildIndOptions(){
-  const cnt=new Map();
+  const secCnt=new Map(), indCnt=new Map();
   for(const mkt of MKTS[mode]){
     let last=null;
     for(let i=dates.length-1;i>=0;i--){ if(byDate[mkt][dates[i]]){ last=dates[i]; break; } }
     if(!last) continue;
-    byDate[mkt][last].forEach(o=>{ const k=indOf(o); cnt.set(k,(cnt.get(k)||0)+1); });
+    byDate[mkt][last].forEach(o=>{
+      const s=sectorOf(mkt,o); secCnt.set(s,(secCnt.get(s)||0)+1);
+      const k=indOf(o); indCnt.set(k,(indCnt.get(k)||0)+1);
+    });
   }
+  const secs=SECTORS.filter(s=>secCnt.has(s)).map(s=>[s,secCnt.get(s)]);
+  for(const extra of ['其他','未分类']) if(secCnt.has(extra)) secs.push([extra,secCnt.get(extra)]);
+  const inds=[...indCnt.entries()].sort((a,b)=>b[1]-a[1]);
+  const opt=([k,v],p)=>`<option value="${p}:${k}">${k} (${v})</option>`;
   const sel=document.getElementById('ind');
-  const items=[...cnt.entries()].sort((a,b)=>b[1]-a[1]);
   sel.innerHTML='<option value="all">全部行业</option>'+
-    items.map(([k,v])=>`<option value="${k}">${k} (${v})</option>`).join('');
+    `<optgroup label="── 行业大类(三市场统一)">${secs.map(x=>opt(x,'S')).join('')}</optgroup>`+
+    `<optgroup label="── 细分行业">${inds.map(x=>opt(x,'I')).join('')}</optgroup>`;
   sel.value='all';
 }
 
