@@ -1,52 +1,52 @@
 name: update-hk-data
-  
-  on:
-    schedule:
-      # 港时 20:00 = UTC 12:00,周一至周五(GitHub cron 用 UTC)
-      - cron: "0 12 * * 1-5"
-    workflow_dispatch: {}   # 允许手动触发
+
+on:
+  schedule:
+    # 港时 20:00 = UTC 12:00,周一至周五(GitHub cron 用 UTC)
+    - cron: "0 12 * * 1-5"
+  workflow_dispatch: {}   # 允许手动触发
 
 permissions:
-    contents: write
+  contents: write
 
 concurrency:
-    group: update-hk-data
-    cancel-in-progress: false
-  
-  jobs:
-    update:
-      runs-on: ubuntu-latest
-      timeout-minutes: 120
-      steps:
-        - uses: actions/checkout@v4
+  group: update-hk-data
+  cancel-in-progress: false
 
-        - uses: actions/setup-python@v5
-          with:
-            python-version: "3.11"
-            cache: pip
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
 
-        - name: Install deps
-          run: pip install -r requirements.txt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
 
-        - name: Fetch A-share data
-          run: python fetch_a.py
+      - name: Install deps
+        run: pip install -r requirements.txt
 
-        - name: Fetch US data
-          run: python fetch_us.py
+      - name: Fetch A-share data
+        run: python fetch_a.py
 
-        - name: Fetch HK data
-          run: python fetch_hk.py
-  
-        - name: Commit & push snapshot
-          run: |
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add data/
-            if git diff --staged --quiet; then
-              echo "无变化,跳过提交"
-            else
-              git commit -m "data: $(TZ=Asia/Hong_Kong date +%F) 港股+A股+美股快照"
-              for i in 1 2 3 4 5; do
-                git pull --rebase origin main && git push && { echo "push 成功"; break; } || { echo "第 $i 次 push 冲突,重试"; sleep 5; }
-              done
-            fi
+      - name: Fetch US data
+        run: python fetch_us.py
+
+      - name: Fetch HK data
+        run: python fetch_hk.py
+
+      - name: Commit & push snapshot
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --staged --quiet; then
+            echo "无变化,跳过提交"
+          else
+            git commit -m "data: $(TZ=Asia/Hong_Kong date +%F) 港股+A股+美股快照"
+            for i in 1 2 3 4 5; do
+              git pull --rebase origin main && git push && { echo "push 成功"; break; } || { echo "第 $i 次 push 冲突,重试"; sleep 5; }
+            done
+          fi
