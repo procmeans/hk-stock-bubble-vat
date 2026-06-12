@@ -82,6 +82,13 @@ const byDate={HK:{}, A:{}};                     // byDate[mkt][date] = Map(code 
 const USD_PER={HK:1/7.80, A:1/7.15};            // 市值折算成美元(亿)
 const TITLES={hk:'港股市值 · 估值气泡缸', a:'A股市值 · 估值气泡缸', both:'港股 + A股 · 估值气泡缸'};
 const inMode=n=> mode==='both' || (mode==='hk' ? n.mkt==='HK' : n.mkt==='A');
+// 该日期在当前模式下有没有数据(两市更新时间不同,日期并集里会有单边空缺);同缸模式要求两市都有
+const hasData=d=> mode==='hk' ? !!byDate.HK[d] : mode==='a' ? !!byDate.A[d] : !!(byDate.HK[d]&&byDate.A[d]);
+function latestIdxWithData(){
+  for(let i=dates.length-1;i>=0;i--) if(hasData(dates[i])) return i;
+  for(let i=dates.length-1;i>=0;i--) if(byDate.HK[dates[i]]||byDate.A[dates[i]]) return i;  // 兜底:任一市场有数据
+  return dates.length-1;
+}
 
 function computeVat(){
   W=innerWidth;H=innerHeight;
@@ -118,7 +125,11 @@ async function load(){
   nodes.forEach(n=>{ n.x=(vat.x0+vat.x1)/2+(Math.random()-0.5)*vat.w*0.8; n.y=vat.rim+Math.random()*(vat.bot-vat.rim); });
   document.getElementById('loading').style.display='none';
   setupUI();
-  idx=dates.length-1; applyDate(true);
+  // URL 带 #a / #both 时直接以对应模式打开(可分享链接)
+  const h=location.hash.replace('#','');
+  if(h==='a'||h==='both'){ mode=h;
+    document.querySelectorAll('#mkt button').forEach(b=>b.classList.toggle('on',b.dataset.mode===h)); }
+  idx=latestIdxWithData(); applyDate(true);
   startSim();
 }
 
@@ -172,6 +183,7 @@ function applyDate(initial){
 function setMode(m){
   mode=m;
   document.querySelectorAll('#mkt button').forEach(b=>b.classList.toggle('on',b.dataset.mode===m));
+  if(!hasData(dates[idx])) idx=latestIdxWithData();   // 当前日期在新模式下没数据就跳到最近有数据的一天
   applyDate(false);
   if(sim) sim.alpha(0.9).restart();
 }
