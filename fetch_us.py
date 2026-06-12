@@ -28,7 +28,7 @@ URL = "https://72.push2.eastmoney.com/api/qt/clist/get"
 def fetch_page(page, retries=4, pause=1.0):
     params = {
         "pn": page, "pz": 100, "po": 1, "np": 1, "fltt": 2, "invt": 2,
-        "fid": "f20", "fs": "m:105,m:106,m:107", "fields": "f12,f14,f20,f115",
+        "fid": "f20", "fs": "m:105,m:106,m:107", "fields": "f12,f14,f20,f115,f100",
     }
     for i in range(retries):
         try:
@@ -61,10 +61,12 @@ def main():
             if not isinstance(pe, (int, float)):
                 continue
             seen.add(code)
+            ind = row.get("f100")
             recs.append({
                 "code": code, "name": name,
                 "pe": round(float(pe), 2), "mc": round(mc / 1e8, 2),  # 亿美元
                 "rev": None, "profit": None, "cur": "USD",
+                "ind": ind if isinstance(ind, str) and ind != "-" else "",
             })
         if page % 20 == 0:
             print(f"  第 {page} 页,累计有效 {len(recs)}", flush=True)
