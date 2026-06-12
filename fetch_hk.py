@@ -69,6 +69,36 @@ def last_val(symbol, indicator):
     return float(df["value"].iloc[-1])
 
 
+def industry_map():
+    """港股代码 -> 行业(东财 push2 列表的 f100 字段,批量翻页)。失败返回空表,不影响主流程。"""
+    import requests
+    url = "https://72.push2.eastmoney.com/api/qt/clist/get"
+    out, page = {}, 1
+    while True:
+        params = {
+            "pn": page, "pz": 100, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+            "fid": "f12", "fs": "m:128+t:3,m:128+t:4,m:128+t:1,m:128+t:2",
+            "fields": "f12,f100",
+        }
+        d = None
+        for i in range(3):
+            try:
+                d = requests.get(url, params=params, timeout=15).json().get("data")
+                break
+            except Exception:
+                time.sleep(1 + i)
+        if not d or not d.get("diff"):
+            break
+        for row in d["diff"]:
+            ind = row.get("f100")
+            out[str(row.get("f12", ""))] = ind if isinstance(ind, str) and ind != "-" else ""
+        if page * 100 >= d.get("total", 0):
+            break
+        page += 1
+        time.sleep(0.2)
+    return out
+
+
 def fetch_one(code, name):
     """抓单只;缺市值或 PE 返回 None(跳过)。"""
     mc = last_val(code, "总市值")
@@ -118,6 +148,11 @@ def main():
     print(f"有效记录 {len(recs)} 家,用时 {int(time.time()-t0)}s", flush=True)
     if len(recs) < MIN_OK:
         raise SystemExit(f"有效记录过少({len(recs)} < {MIN_OK}),疑似被限流,放弃写入")
+
+    inds = industry_map()
+    print(f"行业映射 {len(inds)} 条", flush=True)
+    for r in recs:
+        r["ind"] = inds.get(r["code"], "")
 
     recs.sort(key=lambda x: -x["mc"])
     os.makedirs(DATA_DIR, exist_ok=True)
