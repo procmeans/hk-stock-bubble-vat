@@ -95,8 +95,11 @@ def fetch_earnings(report_date):
         "股票代码": "code",
         "营业总收入-营业总收入": "rev",
         "净利润-净利润": "profit",
-    })[["code", "rev", "profit"]]
+        "所处行业": "ind",
+    })[["code", "rev", "profit", "ind"]]
     df["code"] = df["code"].astype(str)
+    # 同一代码多行时优先保留行业非空的
+    df = df.sort_values("ind", na_position="last")
     return df.drop_duplicates("code")
 
 
@@ -120,6 +123,7 @@ def main():
             "rev": None if pd.isna(r["rev"]) else float(r["rev"]),
             "profit": None if pd.isna(r["profit"]) else float(r["profit"]),
             "cur": "CNY",
+            "ind": "" if pd.isna(r.get("ind")) else str(r.get("ind")),
         })
 
     os.makedirs(DATA_DIR, exist_ok=True)
