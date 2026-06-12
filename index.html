@@ -134,24 +134,31 @@ async function load(){
 }
 
 // ---- 比例尺 ----
-let rScale, yScale, colScale;
+let rScale, yScale, colScale, peLo=1, peHi=150;
 function buildScales(){
   // 当前模式涉及的市场,跨全部日期取最大美元市值 -> 同一模式内气泡大小跨日期可比
-  const allMC=[];
+  const allMC=[], allPE=[];
   for(const mkt of ['HK','A']){
     if(mode==='hk'&&mkt==='A') continue;
     if(mode==='a'&&mkt==='HK') continue;
-    for(const d in byDate[mkt]) byDate[mkt][d].forEach(o=>allMC.push(o.mc*USD_PER[mkt]));
+    for(const d in byDate[mkt]) byDate[mkt][d].forEach(o=>{
+      allMC.push(o.mc*USD_PER[mkt]); if(o.pe>0) allPE.push(o.pe); });
   }
   rScale=d3.scaleSqrt().domain([0,d3.max(allMC)]).range([1.8, mode==='both'?46:52]);
-  const peLo=1,peHi=150, yTop=vat.rim+40, ySedTop=vat.bot-(vat.bot-vat.rim)*0.20;
+  // PE 高度/配色刻度随当前模式的实际分布自适应(2%~98% 分位数),
+  // 否则 A 股 PE 普遍偏高,固定 1~150 的刻度会把气泡全挤到缸顶
+  allPE.sort((a,b)=>a-b);
+  peLo=Math.max(1, d3.quantileSorted(allPE,0.02)||1);
+  peHi=Math.min(500, d3.quantileSorted(allPE,0.98)||150);
+  if(peHi<peLo*2) peHi=peLo*2;
+  const yTop=vat.rim+40, ySedTop=vat.bot-(vat.bot-vat.rim)*0.20;
   yScale=d3.scaleLog().domain([peLo,peHi]).range([ySedTop-20,yTop]).clamp(true);
-  colScale=d3.scaleSequential(t=>d3.interpolateTurbo(0.12+0.78*t)).domain([Math.log10(1),Math.log10(150)]);
+  colScale=d3.scaleSequential(t=>d3.interpolateTurbo(0.12+0.78*t)).domain([Math.log10(peLo),Math.log10(peHi)]);
 }
 function peToY(pe){ const ySedTop=vat.bot-(vat.bot-vat.rim)*0.20;
-  return pe>0? yScale(Math.max(1,Math.min(150,pe))) : ySedTop+(vat.bot-ySedTop)*0.55; }
+  return pe>0? yScale(Math.max(peLo,Math.min(peHi,pe))) : ySedTop+(vat.bot-ySedTop)*0.55; }
 function colorOf(n){
-  return n.loss ? '#6b7a90' : colScale(Math.log10(Math.max(1,Math.min(150,n.pe))));
+  return n.loss ? '#6b7a90' : colScale(Math.log10(Math.max(peLo,Math.min(peHi,n.pe))));
 }
 
 // ---- 切换日期 / 模式:更新每个节点状态,再加热力导向自然移动 ----
