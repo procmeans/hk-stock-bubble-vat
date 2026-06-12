@@ -35,6 +35,8 @@
   #mkt{display:flex;gap:6px;padding-right:12px;border-right:1px solid rgba(255,255,255,.12)}
   #mkt button{background:transparent;color:#9fb4d4;border:1px solid transparent}
   #mkt button.on{background:#2b3a55;color:#fff;border-color:rgba(140,180,240,.35)}
+  #ind{background:#1a2438;color:#cfe1ff;border:1px solid rgba(140,180,240,.25);border-radius:7px;
+    padding:6px 8px;font-size:13px;max-width:170px;outline:none;cursor:pointer}
   #date{font-variant-numeric:tabular-nums;font-size:14px;font-weight:600;min-width:96px;text-align:center}
   #slider{width:min(38vw,440px)}
   #loading{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
@@ -78,6 +80,7 @@
       <button data-mode="us">美股</button>
       <button data-mode="all">全部同缸</button>
     </div>
+    <select id="ind"><option value="all">全部行业</option></select>
     <button id="play">▶ 播放</button>
     <span id="date">—</span>
     <input id="slider" type="range" min="0" max="0" value="0" step="1">
@@ -98,6 +101,9 @@ const MKT_LABEL={HK:'港股', A:'A股', US:'美股'};
 const MKT_CUR={HK:'HKD', A:'CNY', US:'USD'};
 const MIX_STROKE={HK:'rgba(90,200,250,0.95)', A:'rgba(255,159,67,0.95)', US:'rgba(192,132,252,0.95)'};
 const inMode=n=> MKTS[mode].includes(n.mkt);
+let industry='all';                              // 行业筛选,'all' = 全部
+const indOf=o=> o.ind || '未分类';
+const inIndustry=o=> industry==='all' || indOf(o)===industry;
 // 该日期在当前模式下有没有数据(各市更新时间不同,日期并集里会有单边空缺);同缸模式要求所含市场当天都有
 const hasData=d=> MKTS[mode].every(m=>!!byDate[m][d]);
 function latestIdxWithData(){
@@ -148,6 +154,7 @@ async function load(){
   if(h==='both') h='all';
   if(MKTS[h] && h!=='hk'){ mode=h;
     document.querySelectorAll('#mkt button').forEach(b=>b.classList.toggle('on',b.dataset.mode===h)); }
+  buildIndOptions();
   idx=latestIdxWithData(); applyDate(true);
   startSim();
 }
@@ -159,8 +166,10 @@ function buildScales(){
   const allMC=[], allPE=[];
   for(const mkt of MKTS[mode]){
     for(const d in byDate[mkt]) byDate[mkt][d].forEach(o=>{
+      if(!inIndustry(o)) return;                 // 行业筛选时刻度只看同行业,放大组内差异
       allMC.push(o.mc*USD_PER[mkt]); if(o.pe>0) allPE.push(o.pe); });
   }
+  if(!allMC.length) return;                      // 该行业无数据,保持旧刻度(此时无可见气泡)
   // 最大气泡半径随缸宽缩放,大屏不至于显得空;同缸节点多,整体再缩一档
   const rMax=Math.max(40,Math.min(72,vat.w*0.036))*(mode==='all'?0.8:1);
   rScale=d3.scaleSqrt().domain([0,d3.max(allMC)]).range([1.8, rMax]);
@@ -187,9 +196,9 @@ function applyDate(initial){
   let nViz=0,nLoss=0; const byMkt={HK:0,A:0,US:0};
   for(const n of nodes){
     const cur=byDate[n.mkt][date], o=cur&&cur.get(n.code);
-    if(!o||!inMode(n)){ n.viz=false; n.r=0; continue; }
+    if(!o||!inMode(n)||!inIndustry(o)){ n.viz=false; n.r=0; continue; }
     n.viz=true; nViz++; byMkt[n.mkt]++;
-    n.pe=o.pe; n.mc=o.mc; n.rev=o.rev; n.profit=o.profit; n.cur=o.cur; n.name=o.name;
+    n.pe=o.pe; n.mc=o.mc; n.rev=o.rev; n.profit=o.profit; n.cur=o.cur; n.name=o.name; n.ind=o.ind||'';
     n.mcUSD=o.mc*USD_PER[n.mkt];
     n.r=rScale(n.mcUSD); n.ty=peToY(o.pe); n.loss=o.pe<=0; if(n.loss)nLoss++;
     const prev= idx>0 ? byDate[n.mkt][dates[idx-1]] : null, p=prev&&prev.get(n.code);
@@ -201,6 +210,7 @@ function applyDate(initial){
   document.getElementById('title').textContent=TITLES[mode];
   document.getElementById('mixrows').style.display = mode==='all' ? '' : 'none';
   let s=`${date}  ·  共 ${nViz} 家  ·  盈利 ${nViz-nLoss}  ·  亏损 ${nLoss}`;
+  if(industry!=='all') s+=`  ·  ${industry}`;
   if(mode==='all') s+=`  ·  `+MKTS.all.map(m=>`${MKT_LABEL[m]} ${byMkt[m]}`).join(' / ');
   if(nViz===0) s=`${date}  ·  该日暂无数据`;
   document.getElementById('stat').textContent=s;
@@ -211,9 +221,26 @@ function applyDate(initial){
 function setMode(m){
   mode=m;
   document.querySelectorAll('#mkt button').forEach(b=>b.classList.toggle('on',b.dataset.mode===m));
+  industry='all'; buildIndOptions();                  // 行业列表随市场重建
   if(!hasData(dates[idx])) idx=latestIdxWithData();   // 当前日期在新模式下没数据就跳到最近有数据的一天
   applyDate(false);
   if(sim) sim.alpha(0.9).restart();
+}
+
+// 行业下拉:统计当前模式各行业公司数(取各市场最近一天),按数量排序
+function buildIndOptions(){
+  const cnt=new Map();
+  for(const mkt of MKTS[mode]){
+    let last=null;
+    for(let i=dates.length-1;i>=0;i--){ if(byDate[mkt][dates[i]]){ last=dates[i]; break; } }
+    if(!last) continue;
+    byDate[mkt][last].forEach(o=>{ const k=indOf(o); cnt.set(k,(cnt.get(k)||0)+1); });
+  }
+  const sel=document.getElementById('ind');
+  const items=[...cnt.entries()].sort((a,b)=>b[1]-a[1]);
+  sel.innerHTML='<option value="all">全部行业</option>'+
+    items.map(([k,v])=>`<option value="${k}">${k} (${v})</option>`).join('');
+  sel.value='all';
 }
 
 // 计算每个气泡能否在圈内放下名字:能放下就记字号 n.lf,放不下则 lf=0
@@ -316,6 +343,11 @@ function setupUI(){
   document.querySelectorAll('#mkt button').forEach(b=>{
     b.onclick=()=>{ if(b.dataset.mode!==mode) setMode(b.dataset.mode); };
   });
+  document.getElementById('ind').onchange=e=>{
+    industry=e.target.value;
+    applyDate(false);
+    if(sim) sim.alpha(0.9).restart();
+  };
 }
 function togglePlay(){
   const btn=document.getElementById('play');
@@ -359,8 +391,10 @@ cv.addEventListener('mousemove',e=>{ const mx=e.clientX,my=e.clientY; let hit=nu
     const mcCur = MKT_CUR[hit.mkt];
     const orig = mcCur==='USD' ? '' : ` <span class="dim">(${fmtMC(hit.mc)} ${mcCur})</span>`;
     const chg = hit.chg==null? '' : ` <span class="dim">较前一日 ${fmtPct(hit.chg)}</span>`;
-    const fin = hit.rev==null&&hit.profit==null ? '' :
-      `<br><span class="dim">营收 ${fmtBig(hit.rev)} · 净利 ${fmtBig(hit.profit)} ${hit.cur||''}</span>`;
+    const parts=[];
+    if(hit.rev!=null||hit.profit!=null) parts.push(`营收 ${fmtBig(hit.rev)} · 净利 ${fmtBig(hit.profit)} ${hit.cur||''}`);
+    if(hit.ind) parts.push(hit.ind);
+    const fin = parts.length? `<br><span class="dim">${parts.join('  ·  ')}</span>` : '';
     tip.innerHTML=`<b>${hit.name}</b> <span class="dim">${hit.code}</span>${badge}<br>`+
       `市值:<b>${fmtMC(hit.mcUSD)}</b> USD${orig}${chg}<br>`+
       `PE(TTM):<span class="pe">${hit.pe}</span>${hit.pe<=0?' <span class="dim">(亏损)</span>':''}`+fin;
