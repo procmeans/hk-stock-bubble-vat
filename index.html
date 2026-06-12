@@ -39,6 +39,12 @@
   #slider{width:min(38vw,440px)}
   #loading{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
     z-index:20;font-size:15px;color:#9fb4d4;background:#0a0e1a}
+  #search{position:absolute;top:128px;left:50%;transform:translateX(-50%);z-index:6;
+    width:210px;padding:6px 12px;font-size:13px;color:#e8eef7;text-align:center;
+    background:rgba(15,22,40,.7);border:1px solid rgba(140,180,240,.3);border-radius:16px;
+    outline:none;backdrop-filter:blur(6px)}
+  #search::placeholder{color:#5f7393}
+  #search:focus{border-color:rgba(140,180,240,.7)}
 </style>
 </head>
 <body>
@@ -62,6 +68,7 @@
     </div>
   </div>
   <canvas id="cv"></canvas>
+  <input id="search" placeholder="搜索:名称或代码 ↵" autocomplete="off" spellcheck="false">
   <div id="tip"></div>
   <div id="ctl">
     <div id="mkt">
@@ -283,6 +290,19 @@ function draw(){
   ctx.fillStyle='rgba(255,255,255,0.96)';ctx.textAlign='center';ctx.textBaseline='middle';
   for(const n of nodes){ if(n.viz&&n.lf){ ctx.font=n.lf+'px "PingFang SC","Microsoft YaHei",sans-serif';
     ctx.fillText(n.lname,n.x,n.y);} }
+  // 搜索定位:虚线圈 + 名字标牌(气泡太小时也能看清)
+  if(hl && hl.viz){
+    const rr=Math.max(hl.r+7,16);
+    ctx.beginPath();ctx.arc(hl.x,hl.y,rr,0,Math.PI*2);
+    ctx.strokeStyle='#ffd84d';ctx.lineWidth=2.5;ctx.setLineDash([7,5]);ctx.stroke();ctx.setLineDash([]);
+    const txt=hl.name+(hlMatches.length>1?`  ${hlIdx+1}/${hlMatches.length}`:'');
+    ctx.font='13px "PingFang SC","Microsoft YaHei",sans-serif';
+    const tw=ctx.measureText(txt).width, ty=hl.y-rr-16;
+    ctx.fillStyle='rgba(10,15,28,.92)';
+    ctx.fillRect(hl.x-tw/2-8,ty-11,tw+16,22);
+    ctx.strokeStyle='rgba(255,216,77,.7)';ctx.lineWidth=1;ctx.strokeRect(hl.x-tw/2-8,ty-11,tw+16,22);
+    ctx.fillStyle='#ffd84d';ctx.fillText(txt,hl.x,ty);
+  }
   drawGlass();
 }
 
@@ -305,6 +325,29 @@ function togglePlay(){
   timer=setInterval(()=>{ if(idx>=dates.length-1){ clearInterval(timer);playing=false;btn.textContent='▶ 播放';return; }
     idx++; applyDate(false); }, 1400);
 }
+
+// ---- 搜索定位 ----
+let hl=null, hlMatches=[], hlIdx=0, hlKey='';
+const si=document.getElementById('search');
+si.addEventListener('mouseenter',()=>si.focus());   // 鼠标移上去即可打字
+si.addEventListener('keydown',e=>{
+  if(e.key==='Escape'){ si.value=''; hl=null; hlMatches=[]; hlKey=''; draw(); si.blur(); return; }
+  if(e.key!=='Enter') return;
+  const q=si.value.trim().toLowerCase();
+  if(!q){ hl=null; hlMatches=[]; hlKey=''; draw(); return; }
+  if(q===hlKey && hlMatches.length){            // 同一关键词再按 Enter:在多个匹配间轮换
+    hlIdx=(hlIdx+1)%hlMatches.length;
+  }else{
+    const vis=nodes.filter(n=>n.viz);
+    const exact=vis.filter(n=>n.code.toLowerCase()===q||n.name.toLowerCase()===q);
+    const fuzzy=vis.filter(n=>!exact.includes(n)&&(n.name.toLowerCase().includes(q)||n.code.toLowerCase().includes(q)))
+                   .sort((a,b)=>b.mcUSD-a.mcUSD);
+    hlMatches=[...exact,...fuzzy]; hlIdx=0; hlKey=q;
+  }
+  hl=hlMatches[hlIdx]||null;
+  draw();
+});
+si.addEventListener('input',()=>{ if(!si.value.trim()){ hl=null; hlMatches=[]; hlKey=''; draw(); } });
 
 // ---- 悬停 ----
 cv.addEventListener('mousemove',e=>{ const mx=e.clientX,my=e.clientY; let hit=null,best=1e9;
