@@ -37,11 +37,14 @@ jobs:
       - name: Fetch HK data
         run: python fetch_hk.py
 
+      - name: Cleanup old snapshots
+        run: python cleanup.py
+
       - name: Commit & push snapshot
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/
+          git add -A data/
           if git diff --staged --quiet; then
             echo "无变化,跳过提交"
           else
