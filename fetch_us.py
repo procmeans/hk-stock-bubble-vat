@@ -27,14 +27,18 @@ MIN_MC = 1e8  # 1 亿美元以下的微型股不要
 URL = "https://72.push2.eastmoney.com/api/qt/clist/get"
 
 
-def fetch_page(page, retries=4, pause=1.0):
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+
+def fetch_page(page, retries=6, pause=1.5):
     params = {
         "pn": page, "pz": 100, "po": 1, "np": 1, "fltt": 2, "invt": 2,
         "fid": "f20", "fs": "m:105,m:106,m:107", "fields": "f12,f14,f20,f115,f100",
     }
     for i in range(retries):
         try:
-            r = requests.get(URL, params=params, timeout=15)
+            r = requests.get(URL, params=params, timeout=20,
+                             headers={"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"})
             d = r.json().get("data")
             if d is not None:
                 return d
@@ -69,9 +73,23 @@ def main():
     print(f"纳斯达克行业表 {len(nas)} 条", flush=True)
     recs, seen = [], set()
     page, total = 1, None
+    fails = 0
     while True:
         d = fetch_page(page)
-        if d is None or not d.get("diff"):
+        if d is None:
+            # 单页拉取失败(限流/网络)不要直接放弃整轮翻页:跳过本页继续,
+            # 累计失败过多才停。列表按市值降序,跳过中段页只损失少量中小盘。
+            fails += 1
+            print(f"  第 {page} 页拉取失败(累计 {fails}),跳过继续", flush=True)
+            if fails > 12:
+                print("  累计失败过多,提前结束翻页", flush=True)
+                break
+            if total and page * 100 >= total:
+                break
+            page += 1
+            time.sleep(1.5)
+            continue
+        if not d.get("diff"):
             break
         total = total or d.get("total", 0)
         for row in d["diff"]:
@@ -123,4 +141,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # 单个市场抓取失败(限流/网络/接口异常)只跳过本市场、保留上次快照,
+    # 以 exit 0 退出,绝不阻断同一 Actions 作业里其它市场的写入与提交推送。
+    import sys
+    try:
+        main()
+    except KeyboardInterrupt:
+        raise
+    except BaseException as e:
+        print(f"⚠ 美股抓取未完成,跳过、保留上次快照:{e}", flush=True)
+        sys.exit(0)
