@@ -174,4 +174,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # 单个市场抓取失败(限流/网络/接口异常)只跳过本市场、保留上次快照,
+    # 以 exit 0 退出,绝不阻断同一 Actions 作业里其它市场的写入与提交推送。
+    import sys
+    try:
+        main()
+    except KeyboardInterrupt:
+        raise
+    except BaseException as e:
+        print(f"⚠ 港股抓取未完成,跳过、保留上次快照:{e}", flush=True)
+        sys.exit(0)
