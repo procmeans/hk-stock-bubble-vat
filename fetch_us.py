@@ -10,7 +10,8 @@
 数据源(兜底):东财 push2 行情列表翻页(f20=市值 f115=PE),仅当主源异常时启用。
 行业:用纳斯达克官方 screener 的 symbol→细分行业表,经 gics_map 映射到 GICS 二级。
 
-过滤:总市值 < MIN_MC 美元的微型股丢弃;PE 非数值(亏损/缺失)不收。
+过滤:总市值 < MIN_MC 美元的微型股丢弃。无 PE / 负 PE(SPAC、亏损股)照收,
+  pe 存为 null/负值——前端会把它们沉到缸底沉淀区(尤其大市值的不能丢)。
 正确性保护:有效记录 < MIN_OK 视为接口异常,跳过写入、保留上次快照(入口兜底 exit 0)。
 """
 import datetime
@@ -159,8 +160,6 @@ def build_recs(raw_rows, nas):
             continue
         if not isinstance(mc, (int, float)) or mc < MIN_MC:
             continue
-        if not isinstance(pe, (int, float)):
-            continue
         seen.add(code)
         # 代码在纳斯达克表里可能用 . / 或去分隔符,做变体匹配取行业
         nind = (nas.get(code) or nas.get(code.replace(".", "/")) or nas.get(code.replace("/", "."))
@@ -168,7 +167,8 @@ def build_recs(raw_rows, nas):
         sec, g = sec_g_for_us(row.get("em_sec", ""), nind, code)
         recs.append({
             "code": code, "name": row.get("name", code),
-            "pe": round(float(pe), 2), "mc": round(mc / 1e8, 2),  # 亿美元
+            "pe": round(float(pe), 2) if isinstance(pe, (int, float)) else None,
+            "mc": round(mc / 1e8, 2),  # 亿美元
             "rev": None, "profit": None, "cur": "USD",
             "ind": nind, "sec": sec, "g": g,
         })
@@ -190,7 +190,8 @@ def main():
     print(f"主数据源:{src},原始 {len(raw)} 行", flush=True)
 
     recs = build_recs(raw, nas)
-    print(f"[{today}] 市值≥{MIN_MC/1e8:.0f}亿美元且有 PE 的 {len(recs)} 只(源:{src})", flush=True)
+    npe = sum(1 for r in recs if isinstance(r["pe"], (int, float)) and r["pe"] > 0)
+    print(f"[{today}] 市值≥{MIN_MC/1e8:.0f}亿美元 {len(recs)} 只(有正PE {npe},无PE/亏损沉底 {len(recs)-npe};源:{src})", flush=True)
     if len(recs) < MIN_OK:
         raise SystemExit(f"有效记录过少({len(recs)} < {MIN_OK}),疑似接口异常,放弃写入")
 
