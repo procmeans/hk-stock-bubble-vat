@@ -136,8 +136,10 @@ function sizeVat(){
   for(const nd of nodes) if(nd.viz){ area+=Math.PI*nd.r*nd.r; if(nd.r>maxR)maxR=nd.r; n++; }
   if(!n){ vat={x0:frame.x0,x1:frame.x1,top:frame.top,bot:frame.bot,rim:rimY}; vat.w=fullW; return; }
   const DENS=0.6;                                    // 目标:气泡约占缸体 60%——让各市场缸体大小拉开明显梯度
-  const frac=Math.max(0.12, Math.min(1, (area/DENS)/(fullW*fullH)));
-  const s=Math.sqrt(frac);                           // 面积比 → 线性缩放比
+  const fracArea=(area/DENS)/(fullW*fullH);          // 气泡总面积需求
+  const fracCount=n/8000;                            // 公司数量也算一份:数量多→缸撑大(全部同缸气泡被缩小,光靠面积会显窄)
+  const frac=Math.max(0.12, Math.min(1, Math.max(fracArea, fracCount)));  // 取较大者:既装得下大气泡,数量多时也够宽
+  const s=Math.sqrt(frac);                           // 面积/数量比 → 线性缩放比
   const w=Math.min(fullW, Math.max(fullW*s, maxR*6+40, 240));   // 宽:留下限,至少装得下最大气泡
   const h=Math.min(fullH, Math.max(fullH*s, maxR*4+40, 170));
   const cx=(frame.x0+frame.x1)/2, bot=frame.bot, top=Math.max(frame.top, bot-h-30);
