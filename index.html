@@ -61,7 +61,7 @@
     <div class="row"><span class="swatch" style="background:#ef5b25"></span>高 PE(贵 / 成长)</div>
     <div class="row"><span class="swatch" style="background:#5bd94a"></span>中 PE</div>
     <div class="row"><span class="swatch" style="background:#3f6fe0"></span>低 PE(便宜 / 价值)</div>
-    <div class="row"><span class="swatch" style="background:#6b7a90"></span>亏损(PE≤0)</div>
+    <div class="row"><span class="swatch" style="background:#6b7a90"></span>亏损 / 无盈利(含 SPAC,沉缸底)</div>
     <div class="row dim">⌖ 圆面积 ∝ 市值 · 高度 ∝ PE</div>
     <div class="row dim" style="max-width:185px">市值统一折算:1 USD =<br>7.80 HKD = 7.15 CNY</div>
     <div id="mixrows" style="display:none">
@@ -208,7 +208,7 @@ function applyDate(initial){
     n.viz=true; nViz++; byMkt[n.mkt]++;
     n.pe=o.pe; n.mc=o.mc; n.rev=o.rev; n.profit=o.profit; n.cur=o.cur; n.name=o.name; n.sec=o.sec||''; n.g=o.g||'';
     n.mcUSD=o.mc*USD_PER[n.mkt];
-    n.r=rScale(n.mcUSD); n.ty=peToY(o.pe); n.loss=o.pe<=0; if(n.loss)nLoss++;
+    n.r=rScale(n.mcUSD); n.ty=peToY(o.pe); n.loss=!(o.pe>0); if(n.loss)nLoss++;  // 无PE(null)/负PE 都算沉底
     const prev= idx>0 ? byDate[n.mkt][dates[idx-1]] : null, p=prev&&prev.get(n.code);
     n.chg = p? (o.mc-p.mc)/p.mc : null;
   }
@@ -217,7 +217,7 @@ function applyDate(initial){
   document.getElementById('slider').value=idx;
   document.getElementById('title').textContent=TITLES[mode];
   document.getElementById('mixrows').style.display = mode==='all' ? '' : 'none';
-  let s=`${date}  ·  共 ${nViz} 家  ·  盈利 ${nViz-nLoss}  ·  亏损 ${nLoss}`;
+  let s=`${date}  ·  共 ${nViz} 家  ·  盈利 ${nViz-nLoss}  ·  亏损/无盈利 ${nLoss}`;
   if(industry!=='all') s+=`  ·  ${industry.slice(2)}`;
   if(mode==='all') s+=`  ·  `+MKTS.all.map(m=>`${MKT_LABEL[m]} ${byMkt[m]}`).join(' / ');
   if(nViz===0) s=`${date}  ·  该日暂无数据`;
@@ -410,9 +410,12 @@ cv.addEventListener('mousemove',e=>{ const mx=e.clientX,my=e.clientY; let hit=nu
     if(hit.rev!=null||hit.profit!=null) parts.push(`营收 ${fmtBig(hit.rev)} · 净利 ${fmtBig(hit.profit)} ${hit.cur||''}`);
     if(hit.g||hit.sec) parts.push(hit.g||hit.sec);
     const fin = parts.length? `<br><span class="dim">${parts.join('  ·  ')}</span>` : '';
+    const peTxt = (typeof hit.pe==='number') ? hit.pe : '—';
+    const peTag = (hit.pe==null) ? ' <span class="dim">(无盈利)</span>'
+                : (hit.pe<=0 ? ' <span class="dim">(亏损)</span>' : '');
     tip.innerHTML=`<b>${hit.name}</b> <span class="dim">${hit.code}</span>${badge}<br>`+
       `市值:<b>${fmtMC(hit.mcUSD)}</b> USD${orig}${chg}<br>`+
-      `PE(TTM):<span class="pe">${hit.pe}</span>${hit.pe<=0?' <span class="dim">(亏损)</span>':''}`+fin;
+      `PE(TTM):<span class="pe">${peTxt}</span>${peTag}`+fin;
   } else tip.style.display='none';
 });
 cv.addEventListener('mouseleave',()=>tip.style.display='none');
