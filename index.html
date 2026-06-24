@@ -206,7 +206,7 @@ function buildSizeScale(){
   }
   if(!allMC.length){ rScale=null; return; }      // 该行业无数据(此时无可见气泡)
   // 最大气泡半径以视口为参考(不再依赖缸宽,避免"缸缩小→泡缩小"死循环);同缸节点多,整体再缩一档
-  const rMax=Math.max(34,Math.min(74,Math.min(W,H*1.35)*0.05))*(mode==='all'?1.2:1)*0.9;  // 同缸气泡放大,填满缸、不显小
+  const rMax=Math.max(34,Math.min(74,Math.min(W,H*1.35)*0.05))*(mode==='all'?1.3:1)*0.9;  // 同缸气泡放大,填满缸、不显小
   rScale=d3.scaleSqrt().domain([0,d3.max(allMC)]).range([1.8, rMax]);
   // PE 高度/配色刻度随当前模式的实际分布自适应(2%~98% 分位数),
   // 否则 A 股 PE 普遍偏高,固定 1~150 的刻度会把气泡全挤到缸顶
