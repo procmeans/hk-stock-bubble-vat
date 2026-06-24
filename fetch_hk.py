@@ -100,16 +100,16 @@ def industry_map():
 
 
 def fetch_one(code, name):
-    """抓单只;缺市值或 PE 返回 None(跳过)。"""
+    """抓单只;只要有市值就收。无 PE/亏损的存 pe=null,前端沉缸底,不丢(尤其大市值)。"""
     mc = last_val(code, "总市值")
     pe = last_val(code, "市盈率(TTM)")
-    if mc is None or pe is None:
+    if mc is None:
         return None
     rp = revenue_profit(code)
     rev, prof = rp.get("rev"), rp.get("profit")
     return {
         "code": code, "name": name,
-        "pe": round(pe, 2), "mc": round(mc, 2),
+        "pe": None if pe is None else round(pe, 2), "mc": round(mc, 2),
         "rev": None if rev is None or pd.isna(rev) else float(rev),
         "profit": None if prof is None or pd.isna(prof) else float(prof),
         "cur": "" if pd.isna(rp.get("cur", "")) else str(rp.get("cur", "")),
