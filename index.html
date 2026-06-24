@@ -119,14 +119,22 @@ function latestIdxWithData(){
 }
 
 let frame={};   // 满屏可用帧(缸体的最大边界);实际缸体在 sizeVat 里按内容多少收缩
+// 据标题、图例(右上,同缸模式更高)、控制条(底部)的实际位置,让缸体边界避开它们,避免遮挡
+function updateFrame(){
+  const padX=Math.max(24,W*0.04);
+  const rect=id=>{ const e=document.getElementById(id); return e?e.getBoundingClientRect():null; };
+  const hd=rect('hd'), lg=rect('legend'), ct=rect('ctl');
+  const topBlock=Math.max(hd?hd.bottom:96, lg?lg.bottom:96);   // 标题与图例谁更靠下,缸顶就让到它下面
+  const top=Math.max(120, topBlock+16);
+  const bot=Math.min(H-60, (ct?ct.top:H-70)-16);               // 缸底让到控制条上方
+  frame={x0:padX, x1:W-padX, top, bot};
+}
 function computeVat(){
   W=innerWidth;H=innerHeight;
   cv.width=W*dpr;cv.height=H*dpr;cv.style.width=W+'px';cv.style.height=H+'px';
   ctx.setTransform(dpr,0,0,dpr,0,0);
-  // 顶部留出标题区(标题+两行说明约 105px),再加缸口椭圆半高,避免文字压在缸口上
-  const padX=Math.max(24,W*0.04), top=168, bot=H-86;
-  frame={x0:padX,x1:W-padX,top,bot};
-  vat={x0:padX,x1:W-padX,top,bot,rim:top+30}; vat.w=vat.x1-vat.x0;   // 默认占满,applyDate 里再收缩
+  updateFrame();
+  vat={x0:frame.x0,x1:frame.x1,top:frame.top,bot:frame.bot,rim:frame.top+30}; vat.w=frame.x1-frame.x0;
 }
 // 缸体尺寸随当前可见气泡总面积自适应:内容少→缸小居中,内容多→缸接近满屏。
 // 底部锚定(缸从底往上长),水平居中。气泡半径与缸宽已解耦(rScale 用视口参考),不会死循环。
@@ -198,7 +206,7 @@ function buildSizeScale(){
   }
   if(!allMC.length){ rScale=null; return; }      // 该行业无数据(此时无可见气泡)
   // 最大气泡半径以视口为参考(不再依赖缸宽,避免"缸缩小→泡缩小"死循环);同缸节点多,整体再缩一档
-  const rMax=Math.max(34,Math.min(74,Math.min(W,H*1.35)*0.05))*(mode==='all'?0.82:1)*0.9;
+  const rMax=Math.max(34,Math.min(74,Math.min(W,H*1.35)*0.05))*(mode==='all'?1.2:1)*0.9;  // 同缸气泡放大,填满缸、不显小
   rScale=d3.scaleSqrt().domain([0,d3.max(allMC)]).range([1.8, rMax]);
   // PE 高度/配色刻度随当前模式的实际分布自适应(2%~98% 分位数),
   // 否则 A 股 PE 普遍偏高,固定 1~150 的刻度会把气泡全挤到缸顶
@@ -221,6 +229,10 @@ function colorOf(n){
 
 // ---- 切换日期 / 模式:更新每个节点状态,再加热力导向自然移动 ----
 function applyDate(initial){
+  // 先把标题/图例切到当前模式(同缸模式图例更高),再据其实际高度重算缸体边界
+  document.getElementById('title').textContent=TITLES[mode];
+  document.getElementById('mixrows').style.display = mode==='all' ? '' : 'none';
+  updateFrame();
   buildSizeScale();
   const date=dates[idx];
   let nViz=0,nLoss=0; const byMkt={HK:0,A:0,US:0};
@@ -240,10 +252,9 @@ function applyDate(initial){
   buildYScale();
   for(const n of nodes) if(n.viz) n.ty=peToY(n.pe);
   computeLabels();
+  document.getElementById('search').style.top=(vat.top+4)+'px';   // 隐形搜索框跟随缸口
   document.getElementById('date').textContent=date;
   document.getElementById('slider').value=idx;
-  document.getElementById('title').textContent=TITLES[mode];
-  document.getElementById('mixrows').style.display = mode==='all' ? '' : 'none';
   let s=`${date}  ·  共 ${nViz} 家  ·  盈利 ${nViz-nLoss}  ·  亏损/无盈利 ${nLoss}`;
   if(industry!=='all') s+=`  ·  ${industry.slice(2)}`;
   if(mode==='all') s+=`  ·  `+MKTS.all.map(m=>`${MKT_LABEL[m]} ${byMkt[m]}`).join(' / ');
