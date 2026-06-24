@@ -135,7 +135,7 @@ function sizeVat(){
   let area=0, maxR=0, n=0;
   for(const nd of nodes) if(nd.viz){ area+=Math.PI*nd.r*nd.r; if(nd.r>maxR)maxR=nd.r; n++; }
   if(!n){ vat={x0:frame.x0,x1:frame.x1,top:frame.top,bot:frame.bot,rim:rimY}; vat.w=fullW; return; }
-  const DENS=0.42;                                   // 目标:气泡约占缸体 42%(留出 PE 纵向铺开的空间)
+  const DENS=0.6;                                    // 目标:气泡约占缸体 60%——让各市场缸体大小拉开明显梯度
   const frac=Math.max(0.12, Math.min(1, (area/DENS)/(fullW*fullH)));
   const s=Math.sqrt(frac);                           // 面积比 → 线性缩放比
   const w=Math.min(fullW, Math.max(fullW*s, maxR*6+40, 240));   // 宽:留下限,至少装得下最大气泡
@@ -196,7 +196,7 @@ function buildSizeScale(){
   }
   if(!allMC.length){ rScale=null; return; }      // 该行业无数据(此时无可见气泡)
   // 最大气泡半径以视口为参考(不再依赖缸宽,避免"缸缩小→泡缩小"死循环);同缸节点多,整体再缩一档
-  const rMax=Math.max(34,Math.min(74,Math.min(W,H*1.35)*0.05))*(mode==='all'?0.82:1);
+  const rMax=Math.max(34,Math.min(74,Math.min(W,H*1.35)*0.05))*(mode==='all'?0.82:1)*0.9;
   rScale=d3.scaleSqrt().domain([0,d3.max(allMC)]).range([1.8, rMax]);
   // PE 高度/配色刻度随当前模式的实际分布自适应(2%~98% 分位数),
   // 否则 A 股 PE 普遍偏高,固定 1~150 的刻度会把气泡全挤到缸顶
