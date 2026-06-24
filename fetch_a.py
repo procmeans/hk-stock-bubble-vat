@@ -112,8 +112,8 @@ def main():
     val = fetch_valuation(td)
     earn = fetch_earnings(ANNUAL_REPORT_DATE)
     out = val.merge(earn, on="code", how="left")
-    out = out.dropna(subset=["pe", "mc"])
-    print(f"估值 {len(val)} 只,合并业绩后有效 {len(out)} 只", flush=True)
+    out = out.dropna(subset=["mc"])   # 只要有市值就收;无 PE/亏损的沉缸底,不丢(尤其大市值)
+    print(f"估值 {len(val)} 只,有市值 {len(out)} 只", flush=True)
     if len(out) < MIN_OK:
         raise SystemExit(f"有效记录过少({len(out)} < {MIN_OK}),疑似接口异常,放弃写入")
 
@@ -121,7 +121,8 @@ def main():
     for _, r in out.sort_values("mc", ascending=False).iterrows():
         recs.append({
             "code": r["code"], "name": str(r["name"]),
-            "pe": round(float(r["pe"]), 2), "mc": round(float(r["mc"]), 2),
+            "pe": None if pd.isna(r["pe"]) else round(float(r["pe"]), 2),
+            "mc": round(float(r["mc"]), 2),
             "rev": None if pd.isna(r["rev"]) else float(r["rev"]),
             "profit": None if pd.isna(r["profit"]) else float(r["profit"]),
             "cur": "CNY",
