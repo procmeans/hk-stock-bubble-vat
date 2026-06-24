@@ -118,13 +118,30 @@ function latestIdxWithData(){
   return dates.length-1;
 }
 
+let frame={};   // 满屏可用帧(缸体的最大边界);实际缸体在 sizeVat 里按内容多少收缩
 function computeVat(){
   W=innerWidth;H=innerHeight;
   cv.width=W*dpr;cv.height=H*dpr;cv.style.width=W+'px';cv.style.height=H+'px';
   ctx.setTransform(dpr,0,0,dpr,0,0);
   // 顶部留出标题区(标题+两行说明约 105px),再加缸口椭圆半高,避免文字压在缸口上
   const padX=Math.max(24,W*0.04), top=168, bot=H-86;
-  vat={x0:padX,x1:W-padX,top,bot,rim:top+30}; vat.w=vat.x1-vat.x0;
+  frame={x0:padX,x1:W-padX,top,bot};
+  vat={x0:padX,x1:W-padX,top,bot,rim:top+30}; vat.w=vat.x1-vat.x0;   // 默认占满,applyDate 里再收缩
+}
+// 缸体尺寸随当前可见气泡总面积自适应:内容少→缸小居中,内容多→缸接近满屏。
+// 底部锚定(缸从底往上长),水平居中。气泡半径与缸宽已解耦(rScale 用视口参考),不会死循环。
+function sizeVat(){
+  const fullW=frame.x1-frame.x0, rimY=frame.top+30, fullH=frame.bot-rimY;
+  let area=0, maxR=0, n=0;
+  for(const nd of nodes) if(nd.viz){ area+=Math.PI*nd.r*nd.r; if(nd.r>maxR)maxR=nd.r; n++; }
+  if(!n){ vat={x0:frame.x0,x1:frame.x1,top:frame.top,bot:frame.bot,rim:rimY}; vat.w=fullW; return; }
+  const DENS=0.42;                                   // 目标:气泡约占缸体 42%(留出 PE 纵向铺开的空间)
+  const frac=Math.max(0.12, Math.min(1, (area/DENS)/(fullW*fullH)));
+  const s=Math.sqrt(frac);                           // 面积比 → 线性缩放比
+  const w=Math.min(fullW, Math.max(fullW*s, maxR*6+40, 240));   // 宽:留下限,至少装得下最大气泡
+  const h=Math.min(fullH, Math.max(fullH*s, maxR*4+40, 170));
+  const cx=(frame.x0+frame.x1)/2, bot=frame.bot, top=Math.max(frame.top, bot-h-30);
+  vat={x0:cx-w/2, x1:cx+w/2, top, bot, rim:top+30}; vat.w=w;
 }
 
 // ---- 数据加载 ----
@@ -169,17 +186,17 @@ async function load(){
 
 // ---- 比例尺 ----
 let rScale, yScale, colScale, peLo=1, peHi=150;
-function buildScales(){
-  // 当前模式涉及的市场,跨全部日期取最大美元市值 -> 同一模式内气泡大小跨日期可比
+// ① 气泡大小 + PE 分位:气泡半径以视口为参考(与缸体尺寸解耦),先于缸体确定
+function buildSizeScale(){
   const allMC=[], allPE=[];
   for(const mkt of MKTS[mode]){
     for(const d in byDate[mkt]) byDate[mkt][d].forEach(o=>{
       if(!inIndustry(o)) return;             // 行业筛选时刻度只看同行业,放大组内差异
       allMC.push(o.mc*USD_PER[mkt]); if(o.pe>0) allPE.push(o.pe); });
   }
-  if(!allMC.length) return;                      // 该行业无数据,保持旧刻度(此时无可见气泡)
-  // 最大气泡半径随缸宽缩放,大屏不至于显得空;同缸节点多,整体再缩一档
-  const rMax=Math.max(40,Math.min(72,vat.w*0.036))*(mode==='all'?0.8:1);
+  if(!allMC.length){ rScale=null; return; }      // 该行业无数据(此时无可见气泡)
+  // 最大气泡半径以视口为参考(不再依赖缸宽,避免"缸缩小→泡缩小"死循环);同缸节点多,整体再缩一档
+  const rMax=Math.max(34,Math.min(74,Math.min(W,H*1.35)*0.05))*(mode==='all'?0.82:1);
   rScale=d3.scaleSqrt().domain([0,d3.max(allMC)]).range([1.8, rMax]);
   // PE 高度/配色刻度随当前模式的实际分布自适应(2%~98% 分位数),
   // 否则 A 股 PE 普遍偏高,固定 1~150 的刻度会把气泡全挤到缸顶
@@ -187,6 +204,9 @@ function buildScales(){
   peLo=Math.max(1, d3.quantileSorted(allPE,0.02)||1);
   peHi=Math.min(500, d3.quantileSorted(allPE,0.98)||150);
   if(peHi<peLo*2) peHi=peLo*2;
+}
+// ② PE→高度 / 配色:依赖最终缸体尺寸,在 sizeVat 之后建立
+function buildYScale(){
   const yTop=vat.rim+40, ySedTop=vat.bot-(vat.bot-vat.rim)*0.20;
   yScale=d3.scaleLog().domain([peLo,peHi]).range([ySedTop-20,yTop]).clamp(true);
   colScale=d3.scaleSequential(t=>d3.interpolateTurbo(0.12+0.78*t)).domain([Math.log10(peLo),Math.log10(peHi)]);
@@ -199,19 +219,24 @@ function colorOf(n){
 
 // ---- 切换日期 / 模式:更新每个节点状态,再加热力导向自然移动 ----
 function applyDate(initial){
-  buildScales();
+  buildSizeScale();
   const date=dates[idx];
   let nViz=0,nLoss=0; const byMkt={HK:0,A:0,US:0};
+  // 第一遍:确定可见节点与半径(半径只依赖 rScale,与缸体尺寸无关)
   for(const n of nodes){
     const cur=byDate[n.mkt][date], o=cur&&cur.get(n.code);
-    if(!o||!inMode(n)||!inIndustry(o)){ n.viz=false; n.r=0; continue; }
+    if(!o||!inMode(n)||!inIndustry(o)||!rScale){ n.viz=false; n.r=0; continue; }
     n.viz=true; nViz++; byMkt[n.mkt]++;
     n.pe=o.pe; n.mc=o.mc; n.rev=o.rev; n.profit=o.profit; n.cur=o.cur; n.name=o.name; n.sec=o.sec||''; n.g=o.g||'';
     n.mcUSD=o.mc*USD_PER[n.mkt];
-    n.r=rScale(n.mcUSD); n.ty=peToY(o.pe); n.loss=!(o.pe>0); if(n.loss)nLoss++;  // 无PE(null)/负PE 都算沉底
+    n.r=rScale(n.mcUSD); n.loss=!(o.pe>0); if(n.loss)nLoss++;  // 无PE(null)/负PE 都算沉底
     const prev= idx>0 ? byDate[n.mkt][dates[idx-1]] : null, p=prev&&prev.get(n.code);
     n.chg = p? (o.mc-p.mc)/p.mc : null;
   }
+  // 缸体按内容总量收缩,再据最终缸体建 PE→高度刻度,第二遍写每个节点的目标高度
+  sizeVat();
+  buildYScale();
+  for(const n of nodes) if(n.viz) n.ty=peToY(n.pe);
   computeLabels();
   document.getElementById('date').textContent=date;
   document.getElementById('slider').value=idx;
