@@ -49,3 +49,66 @@ def ew_min(x, y):
 
 def ew_max(x, y):
     return pd.DataFrame(np.maximum(x.values, y.values), index=x.index, columns=x.columns)
+
+
+# ---- 时序 ----
+def delay(x, d):
+    return x.shift(_d(d))
+
+
+def delta(x, d):
+    return x - x.shift(_d(d))
+
+
+def ts_sum(x, d):
+    return x.rolling(_d(d)).sum()
+
+
+def ts_product(x, d):
+    return x.rolling(_d(d)).apply(np.prod, raw=True)
+
+
+def ts_stddev(x, d):
+    return x.rolling(_d(d)).std()
+
+
+def ts_min(x, d):
+    return x.rolling(_d(d)).min()
+
+
+def ts_max(x, d):
+    return x.rolling(_d(d)).max()
+
+
+def ts_argmin(x, d):
+    return x.rolling(_d(d)).apply(np.argmin, raw=True)
+
+
+def ts_argmax(x, d):
+    return x.rolling(_d(d)).apply(np.argmax, raw=True)
+
+
+def ts_rank(x, d):
+    def _r(w):
+        return pd.Series(w).rank(pct=True).iloc[-1]
+    return x.rolling(_d(d)).apply(_r, raw=True)
+
+
+def decay_linear(x, d):
+    d = _d(d)
+    w = np.arange(1, d + 1, dtype=float)
+    w /= w.sum()
+    return x.rolling(d).apply(lambda a: np.dot(a, w), raw=True)
+
+
+def correlation(x, y, d):
+    return x.rolling(_d(d)).corr(y)
+
+
+def covariance(x, y, d):
+    return x.rolling(_d(d)).cov(y)
+
+
+# 别名:论文中 min(x,d)/max(x,d) 即时序 min/max
+min_ = ts_min
+max_ = ts_max
