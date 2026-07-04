@@ -44,6 +44,11 @@ def test_alpha_smoke_not_all_nan(n):
     assert out.shape == P["close"].shape
     # 少数因子(如 #96)嵌套了极小窗口(floor 后仅 3~4 天)的时序相关系数,
     # 其零方差 NaN 会顺着 decay_linear/Ts_Rank 复合窗口向后扩散、覆盖到末行附近,
-    # 这是公式自身数值特性而非翻译错误,故在全表范围内判断"非全 NaN"而非只看末行。
-    tail = out.dropna(how="all")
-    assert len(tail) > 0, f"alpha_{n} 全表皆为 NaN"
+    # 这是公式自身数值特性而非翻译错误,故仅 #96 在全表范围内判断"非全 NaN";
+    # 其他因子应在末行有值。
+    if n == 96:
+        tail = out.dropna(how="all")
+        assert len(tail) > 0, f"alpha_{n} 全表皆为 NaN"
+    else:
+        tail = out.iloc[-1].dropna()
+        assert len(tail) > 0, f"alpha_{n} 末行全 NaN"

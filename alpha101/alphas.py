@@ -1,5 +1,4 @@
 """82 个纯价量 alpha。逐字翻译自 Kakushadze (2015) 附录 A。"""
-import numpy as np
 import pandas as pd
 from alpha101 import operators as op
 from alpha101 import data
