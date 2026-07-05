@@ -34,7 +34,7 @@
 
 - `returns` = 日 close-to-close 收益
 - `open, high, low, close, volume` = 标准日线,**前复权**(处理分红送股)
-- `vwap` = 日成交量加权均价;A 股日线无原生 vwap,用 `amount / volume`(成交额/成交量)近似
+- `vwap` = 日成交量加权均价;A 股日线无原生 vwap,用 `amount / (volume * 100)`(成交额/成交量)近似(akshare 成交量单位为**手**,1 手=100 股,故需 ×100 换算为每股价)
 - `adv{d}` = 过去 d 日平均日成交额(dollar volume)
 
 ### 来源与缓存

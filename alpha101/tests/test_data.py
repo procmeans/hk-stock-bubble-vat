@@ -8,8 +8,9 @@ def _raw():
     rows = []
     for code in ["000001", "000002"]:
         for i, day in enumerate(pd.date_range("2020-01-01", periods=3)):
+            # volume 单位为手,amount 单位为元 = 每股价格 * volume * 100
             rows.append(dict(code=code, date=day, open=10+i, high=11+i,
-                             low=9+i, close=10.5+i, volume=100+i, amount=(10.5+i)*(100+i)))
+                             low=9+i, close=10.5+i, volume=100+i, amount=(10.5+i)*(100+i)*100))
     return pd.DataFrame(rows)
 
 
@@ -22,7 +23,8 @@ def test_build_panel_shapes_and_fields():
 
 def test_vwap_is_amount_over_volume():
     p = data.build_panel(_raw())
-    assert p["vwap"].iloc[0, 0] == pytest.approx(10.5)  # amount/volume = (10.5*100)/100
+    # 每股 vwap = amount / (volume*100) = (10.5*100*100)/(100*100) = 10.5
+    assert p["vwap"].iloc[0, 0] == pytest.approx(10.5)
 
 
 def test_returns_first_row_nan():

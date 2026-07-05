@@ -15,7 +15,9 @@ def build_panel(raw):
     panel = {}
     for f in FIELDS:
         panel[f] = raw.pivot(index="date", columns="code", values=f).sort_index()
-    panel["vwap"] = panel["amount"] / panel["volume"].replace(0, np.nan)
+    # 成交量(volume)单位为手(1 手 = 100 股),成交额(amount)单位为元,
+    # 故每股 vwap = amount / (volume * 100),否则会放大约 100 倍。
+    panel["vwap"] = panel["amount"] / (panel["volume"].replace(0, np.nan) * 100)
     panel["returns"] = panel["close"].pct_change()
     return panel
 

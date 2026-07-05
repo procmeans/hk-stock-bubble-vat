@@ -15,7 +15,7 @@
 - 因子实现的**纯价量子集 = 82 个**:1–47, 49–55, 57, 60–62, 64–66, 68, 71–75, 77–78, 81, 83–86, 88, 92, 94–96, 98–99, 101(排除用 `IndNeutralize` 的 18 个与用 `cap` 的 #56)。
 - **字段面板**约定:`dict[str, pd.DataFrame]`,每个 DataFrame `index` 为升序 `DatetimeIndex`(交易日),`columns` 为股票代码(str)。字段键:`open,high,low,close,volume,amount,vwap,returns`。
 - **算子约定**:所有算子输入/输出均为 `DataFrame[日期×股票]`;截面算子按行(单日,`axis=1`)运算,时序算子按列(单股)滚动。窗口天数 `d` 若为浮点一律 `int(np.floor(d))`。
-- **前复权**价计算因子;`vwap = amount / volume`(A 股日线无原生 vwap)。
+- **前复权**价计算因子;`vwap = amount / (volume * 100)`(A 股日线无原生 vwap;akshare 成交量单位为手=100 股)。
 - **防未来函数**:T 日因子预测 T+1 收益(默认收盘对齐,`fwd_ret = close.shift(-1)/close - 1`)。
 
 ---
