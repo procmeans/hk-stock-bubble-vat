@@ -1,0 +1,7 @@
+pandas
+numpy
+scipy
+akshare
+matplotlib
+pyarrow
+pytest
