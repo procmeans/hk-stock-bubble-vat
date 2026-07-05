@@ -95,10 +95,15 @@ def ts_rank(x, d):
 
 
 def decay_linear(x, d):
+    # 线性衰减加权移动平均:权重 d,d-1,...,1(最近权重最大),归一化。
+    # 用移位加权和向量化(等价于对窗口做加权点积,但避免逐窗 Python 调用)。
     d = _d(d)
-    w = np.arange(1, d + 1, dtype=float)
+    w = np.arange(d, 0, -1, dtype=float)   # shift 0(最近)权重 d,...,shift d-1 权重 1
     w /= w.sum()
-    return x.rolling(d).apply(lambda a: np.dot(a, w), raw=True)
+    out = x * w[0]
+    for k in range(1, d):
+        out = out + x.shift(k) * w[k]
+    return out
 
 
 def correlation(x, y, d):
