@@ -31,6 +31,16 @@ def test_ew_max_elementwise():
     assert op.ew_max(x, y).iloc[0].tolist() == [4.0, 5.0, 3.0]
 
 
+def test_indneutralize_demeans_within_group():
+    # A,B 同组 -> 减组均值2;C 单独一组 -> 归零
+    df = pd.DataFrame([[1.0, 3.0, 10.0]],
+                      index=pd.date_range("2020-01-01", periods=1),
+                      columns=["A", "B", "C"])
+    groups = pd.Series({"A": "g1", "B": "g1", "C": "g2"})
+    out = op.indneutralize(df, groups).iloc[0]
+    assert out.tolist() == [-1.0, 1.0, 0.0]
+
+
 def test_delta():
     df = _df([[1.0, 0, 0], [3.0, 0, 0], [7.0, 0, 0]])[["A"]]
     assert op.delta(df, 1)["A"].tolist()[1:] == [2.0, 4.0]

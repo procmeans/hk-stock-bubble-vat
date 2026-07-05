@@ -903,6 +903,133 @@ def alpha_101(P):
     return (P["close"] - P["open"]) / ((P["high"] - P["low"]) + 0.001)
 
 
+# ============ 行业中性化 alpha(需 P["ind"]=Series(code->行业))============
+# 论文 IndClass.sector/industry/subindustry 各级,这里统一映射到单一行业分类。
+
+def alpha_48(P):
+    """indneutralize((correlation(delta(close,1),delta(delay(close,1),1),250)*delta(close,1))/close, IndClass.subindustry) / sum((delta(close,1)/delay(close,1))^2, 250)"""
+    num = op.indneutralize((op.correlation(op.delta(P["close"], 1), op.delta(op.delay(P["close"], 1), 1), 250) * op.delta(P["close"], 1)) / P["close"], P["ind"])
+    den = op.ts_sum((op.delta(P["close"], 1) / op.delay(P["close"], 1)) ** 2, 250)
+    return num / den
+
+
+def alpha_58(P):
+    """-1*Ts_Rank(decay_linear(correlation(IndNeutralize(vwap,IndClass.sector),volume,3.92795),7.89291),5.50322)"""
+    return -1 * op.ts_rank(op.decay_linear(op.correlation(op.indneutralize(P["vwap"], P["ind"]), P["volume"], 3.92795), 7.89291), 5.50322)
+
+
+def alpha_59(P):
+    """-1*Ts_Rank(decay_linear(correlation(IndNeutralize((vwap*0.728317)+(vwap*(1-0.728317)),IndClass.industry),volume,4.25197),16.2289),8.19648)"""
+    w = P["vwap"] * 0.728317 + P["vwap"] * (1 - 0.728317)
+    return -1 * op.ts_rank(op.decay_linear(op.correlation(op.indneutralize(w, P["ind"]), P["volume"], 4.25197), 16.2289), 8.19648)
+
+
+def alpha_63(P):
+    """(rank(decay_linear(delta(IndNeutralize(close,IndClass.industry),2.25164),8.22237)) - rank(decay_linear(correlation((vwap*0.318108)+(open*(1-0.318108)),sum(adv180,37.2467),13.557),12.2883)))*-1"""
+    a = op.rank(op.decay_linear(op.delta(op.indneutralize(P["close"], P["ind"]), 2.25164), 8.22237))
+    b = op.rank(op.decay_linear(op.correlation(P["vwap"] * 0.318108 + P["open"] * (1 - 0.318108), op.ts_sum(data.adv(P, 180), 37.2467), 13.557), 12.2883))
+    return (a - b) * -1
+
+
+def alpha_67(P):
+    """(rank(high-ts_min(high,2.14593))^rank(correlation(IndNeutralize(vwap,IndClass.sector),IndNeutralize(adv20,IndClass.subindustry),6.02936)))*-1"""
+    a = op.rank(P["high"] - op.ts_min(P["high"], 2.14593))
+    b = op.rank(op.correlation(op.indneutralize(P["vwap"], P["ind"]), op.indneutralize(data.adv(P, 20), P["ind"]), 6.02936))
+    return (a ** b) * -1
+
+
+def alpha_69(P):
+    """(rank(ts_max(delta(IndNeutralize(vwap,IndClass.industry),2.72412),4.79344))^Ts_Rank(correlation((close*0.490655)+(vwap*(1-0.490655)),adv20,4.92416),9.0615))*-1"""
+    a = op.rank(op.ts_max(op.delta(op.indneutralize(P["vwap"], P["ind"]), 2.72412), 4.79344))
+    b = op.ts_rank(op.correlation(P["close"] * 0.490655 + P["vwap"] * (1 - 0.490655), data.adv(P, 20), 4.92416), 9.0615)
+    return (a ** b) * -1
+
+
+def alpha_70(P):
+    """(rank(delta(vwap,1.29456))^Ts_Rank(correlation(IndNeutralize(close,IndClass.industry),adv50,17.8256),17.9171))*-1"""
+    a = op.rank(op.delta(P["vwap"], 1.29456))
+    b = op.ts_rank(op.correlation(op.indneutralize(P["close"], P["ind"]), data.adv(P, 50), 17.8256), 17.9171)
+    return (a ** b) * -1
+
+
+def alpha_76(P):
+    """max(rank(decay_linear(delta(vwap,1.24383),11.8259)),Ts_Rank(decay_linear(Ts_Rank(correlation(IndNeutralize(low,IndClass.sector),adv81,8.14941),19.569),17.1543),19.383))*-1"""
+    a = op.rank(op.decay_linear(op.delta(P["vwap"], 1.24383), 11.8259))
+    b = op.ts_rank(op.decay_linear(op.ts_rank(op.correlation(op.indneutralize(P["low"], P["ind"]), data.adv(P, 81), 8.14941), 19.569), 17.1543), 19.383)
+    return op.ew_max(a, b) * -1
+
+
+def alpha_79(P):
+    """rank(delta(IndNeutralize((close*0.60733)+(open*(1-0.60733)),IndClass.sector),1.23438)) < rank(correlation(Ts_Rank(vwap,3.60973),Ts_Rank(adv150,9.18637),14.6644))"""
+    a = op.rank(op.delta(op.indneutralize(P["close"] * 0.60733 + P["open"] * (1 - 0.60733), P["ind"]), 1.23438))
+    b = op.rank(op.correlation(op.ts_rank(P["vwap"], 3.60973), op.ts_rank(data.adv(P, 150), 9.18637), 14.6644))
+    return (a < b).astype(float)
+
+
+def alpha_80(P):
+    """(rank(Sign(delta(IndNeutralize((open*0.868128)+(high*(1-0.868128)),IndClass.industry),4.04545)))^Ts_Rank(correlation(high,adv10,5.11456),5.53756))*-1"""
+    a = op.rank(op.sign_(op.delta(op.indneutralize(P["open"] * 0.868128 + P["high"] * (1 - 0.868128), P["ind"]), 4.04545)))
+    b = op.ts_rank(op.correlation(P["high"], data.adv(P, 10), 5.11456), 5.53756)
+    return (a ** b) * -1
+
+
+def alpha_82(P):
+    """min(rank(decay_linear(delta(open,1.46063),14.8717)),Ts_Rank(decay_linear(correlation(IndNeutralize(volume,IndClass.sector),(open*0.634196)+(open*(1-0.634196)),17.4842),6.92131),13.4283))*-1"""
+    a = op.rank(op.decay_linear(op.delta(P["open"], 1.46063), 14.8717))
+    b = op.ts_rank(op.decay_linear(op.correlation(op.indneutralize(P["volume"], P["ind"]), P["open"], 17.4842), 6.92131), 13.4283)
+    return op.ew_min(a, b) * -1
+
+
+def alpha_87(P):
+    """max(rank(decay_linear(delta((close*0.369701)+(vwap*(1-0.369701)),1.91233),2.65461)),Ts_Rank(decay_linear(abs(correlation(IndNeutralize(adv81,IndClass.industry),close,13.4132)),4.89768),14.4535))*-1"""
+    a = op.rank(op.decay_linear(op.delta(P["close"] * 0.369701 + P["vwap"] * (1 - 0.369701), 1.91233), 2.65461))
+    b = op.ts_rank(op.decay_linear(op.abs_(op.correlation(op.indneutralize(data.adv(P, 81), P["ind"]), P["close"], 13.4132)), 4.89768), 14.4535)
+    return op.ew_max(a, b) * -1
+
+
+def alpha_89(P):
+    """Ts_Rank(decay_linear(correlation((low*0.967285)+(low*(1-0.967285)),adv10,6.94279),5.51607),3.79744) - Ts_Rank(decay_linear(delta(IndNeutralize(vwap,IndClass.industry),3.48158),10.1466),15.3012)"""
+    a = op.ts_rank(op.decay_linear(op.correlation(P["low"], data.adv(P, 10), 6.94279), 5.51607), 3.79744)
+    b = op.ts_rank(op.decay_linear(op.delta(op.indneutralize(P["vwap"], P["ind"]), 3.48158), 10.1466), 15.3012)
+    return a - b
+
+
+def alpha_90(P):
+    """(rank(close-ts_max(close,4.66719))^Ts_Rank(correlation(IndNeutralize(adv40,IndClass.subindustry),low,5.38375),3.21856))*-1"""
+    a = op.rank(P["close"] - op.ts_max(P["close"], 4.66719))
+    b = op.ts_rank(op.correlation(op.indneutralize(data.adv(P, 40), P["ind"]), P["low"], 5.38375), 3.21856)
+    return (a ** b) * -1
+
+
+def alpha_91(P):
+    """(Ts_Rank(decay_linear(decay_linear(correlation(IndNeutralize(close,IndClass.industry),volume,9.74928),16.398),3.83219),4.8667) - rank(decay_linear(correlation(vwap,adv30,4.01303),2.6809)))*-1"""
+    a = op.ts_rank(op.decay_linear(op.decay_linear(op.correlation(op.indneutralize(P["close"], P["ind"]), P["volume"], 9.74928), 16.398), 3.83219), 4.8667)
+    b = op.rank(op.decay_linear(op.correlation(P["vwap"], data.adv(P, 30), 4.01303), 2.6809))
+    return (a - b) * -1
+
+
+def alpha_93(P):
+    """Ts_Rank(decay_linear(correlation(IndNeutralize(vwap,IndClass.industry),adv81,17.4193),19.848),7.54455) / rank(decay_linear(delta((close*0.524434)+(vwap*(1-0.524434)),2.77377),16.2664))"""
+    a = op.ts_rank(op.decay_linear(op.correlation(op.indneutralize(P["vwap"], P["ind"]), data.adv(P, 81), 17.4193), 19.848), 7.54455)
+    b = op.rank(op.decay_linear(op.delta(P["close"] * 0.524434 + P["vwap"] * (1 - 0.524434), 2.77377), 16.2664))
+    return a / b
+
+
+def alpha_97(P):
+    """(rank(decay_linear(delta(IndNeutralize((low*0.721001)+(vwap*(1-0.721001)),IndClass.industry),3.3705),20.4523)) - Ts_Rank(decay_linear(Ts_Rank(correlation(Ts_Rank(low,7.87871),Ts_Rank(adv60,17.255),4.97547),18.5925),15.7152),6.71659))*-1"""
+    a = op.rank(op.decay_linear(op.delta(op.indneutralize(P["low"] * 0.721001 + P["vwap"] * (1 - 0.721001), P["ind"]), 3.3705), 20.4523))
+    b = op.ts_rank(op.decay_linear(op.ts_rank(op.correlation(op.ts_rank(P["low"], 7.87871), op.ts_rank(data.adv(P, 60), 17.255), 4.97547), 18.5925), 15.7152), 6.71659)
+    return (a - b) * -1
+
+
+def alpha_100(P):
+    """0-(1*((1.5*scale(indneutralize(indneutralize(rank((((close-low)-(high-close))/(high-low))*volume),IndClass.subindustry),IndClass.subindustry))) - scale(indneutralize(correlation(close,rank(adv20),5)-rank(ts_argmin(close,30)),IndClass.subindustry)))*(volume/adv20))"""
+    inner = op.rank((((P["close"] - P["low"]) - (P["high"] - P["close"])) / (P["high"] - P["low"])) * P["volume"])
+    t1 = 1.5 * op.scale(op.indneutralize(op.indneutralize(inner, P["ind"]), P["ind"]))
+    t2 = op.scale(op.indneutralize(op.correlation(P["close"], op.rank(data.adv(P, 20)), 5) - op.rank(op.ts_argmin(P["close"], 30)), P["ind"]))
+    return 0 - (1 * ((t1 - t2) * (P["volume"] / data.adv(P, 20))))
+
+
 ALPHAS = {int(name.split("_")[1]): fn
           for name, fn in list(globals().items())
           if name.startswith("alpha_") and callable(fn)}

@@ -15,6 +15,8 @@ def _panel(n=60, m=8, seed=0):
          "close": close, "volume": rand_pos() * 1000, "amount": rand_pos() * 1e6}
     P["vwap"] = P["amount"] / P["volume"]
     P["returns"] = P["close"].pct_change()
+    # 行业分类(供行业中性化 alpha 用):把 m 只票分到 3 个行业
+    P["ind"] = pd.Series({c: f"g{i % 3}" for i, c in enumerate(cols)})
     return P
 
 

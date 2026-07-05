@@ -136,6 +136,14 @@ def covariance(x, y, d):
     return x.rolling(_d(d)).cov(y)
 
 
+def indneutralize(x, groups):
+    # 行业中性化:每个截面(每天)在每个行业组内去均值(demean)。
+    # groups: Series(index=股票代码 -> 行业);缺失行业归入 UNKNOWN 组。
+    g = pd.Series(groups).reindex(x.columns).fillna("UNKNOWN")
+    grp_mean = x.T.groupby(g).transform("mean").T
+    return x - grp_mean
+
+
 # 别名:论文中 min(x,d)/max(x,d) 即时序 min/max
 min_ = ts_min
 max_ = ts_max
