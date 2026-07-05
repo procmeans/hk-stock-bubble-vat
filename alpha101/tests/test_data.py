@@ -37,3 +37,9 @@ def test_adv_mean_amount():
     a = data.adv(p, 2)
     expected = (p["amount"].iloc[0, 0] + p["amount"].iloc[1, 0]) / 2
     assert a.iloc[1, 0] == pytest.approx(expected)
+
+
+def test_pending_codes_skips_cached_preserves_order():
+    assert data._pending_codes(["a", "b", "c", "d"], ["b", "d"]) == ["a", "c"]
+    assert data._pending_codes(["a", "b"], []) == ["a", "b"]
+    assert data._pending_codes(["a", "b"], ["a", "b"]) == []
