@@ -1,11 +1,28 @@
 """论文《101 Formulaic Alphas》算子实现。所有算子作用于 DataFrame[日期×股票]。"""
 import numpy as np
 import pandas as pd
+from numpy.lib.stride_tricks import sliding_window_view
 
 
 def _d(d):
     """窗口天数:浮点向下取整为 int。"""
     return int(np.floor(d))
+
+
+def _roll_apply_vec(x, d, reducer):
+    """把逐窗归约向量化(替代慢的 rolling.apply)。
+    reducer 输入形状 (n-d+1, m, d) 的窗口数组、沿最后一维归约,返回 (n-d+1, m)。
+    含 NaN 的窗口结果置 NaN,等价于 rolling(d) 默认 min_periods=d 的行为。"""
+    d = _d(d)
+    v = x.to_numpy(dtype=float)
+    n, m = v.shape
+    out = np.full((n, m), np.nan)
+    if n >= d:
+        win = sliding_window_view(v, d, axis=0)     # (n-d+1, m, d)
+        res = reducer(win).astype(float)            # (n-d+1, m)
+        res[np.isnan(win).any(axis=-1)] = np.nan
+        out[d - 1:] = res
+    return pd.DataFrame(out, index=x.index, columns=x.columns)
 
 
 # ---- 逐元素 ----
@@ -65,7 +82,7 @@ def ts_sum(x, d):
 
 
 def ts_product(x, d):
-    return x.rolling(_d(d)).apply(np.prod, raw=True)
+    return _roll_apply_vec(x, d, lambda w: np.prod(w, axis=-1))
 
 
 def ts_stddev(x, d):
@@ -81,17 +98,22 @@ def ts_max(x, d):
 
 
 def ts_argmin(x, d):
-    return x.rolling(_d(d)).apply(np.argmin, raw=True)
+    return _roll_apply_vec(x, d, lambda w: np.argmin(w, axis=-1))
 
 
 def ts_argmax(x, d):
-    return x.rolling(_d(d)).apply(np.argmax, raw=True)
+    return _roll_apply_vec(x, d, lambda w: np.argmax(w, axis=-1))
 
 
 def ts_rank(x, d):
-    def _r(w):
-        return pd.Series(w).rank(pct=True).iloc[-1]
-    return x.rolling(_d(d)).apply(_r, raw=True)
+    # 窗口内最新值的百分位秩(average 法),向量化:
+    # pct = (严格小于个数 + (等于个数含自身+1)/2) / d,与 pandas rank(pct=True).iloc[-1] 等价。
+    def _rank_last(w):
+        last = w[..., -1:]
+        less = (w < last).sum(axis=-1)
+        eq = (w == last).sum(axis=-1)
+        return (less + (eq + 1) / 2.0) / w.shape[-1]
+    return _roll_apply_vec(x, d, _rank_last)
 
 
 def decay_linear(x, d):
