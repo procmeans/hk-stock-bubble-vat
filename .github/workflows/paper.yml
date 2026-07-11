@@ -1,0 +1,40 @@
+name: paper-trading
+
+on:
+  schedule:
+    - cron: "0 22 * * 1-5"   # UTC,美股收盘后
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: paper-trading
+  cancel-in-progress: false
+
+jobs:
+  step:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: pip install pandas numpy yfinance
+
+      - name: Run paper trading step
+        run: python -m strategies.paper run
+
+      - name: Commit & push state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase
+          git add paper/
+          git diff --cached --quiet || git commit -m "paper: daily step $(date -u +%F)"
+          git push
