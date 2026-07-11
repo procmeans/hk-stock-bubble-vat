@@ -79,3 +79,16 @@ def test_init_creates_files_and_refuses_twice(tmp_path, monkeypatch):
     assert (tmp_path / "acct" / "nav.csv").exists()
     with pytest.raises(SystemExit):
         paper.init("acct", 50000.0)
+
+
+def test_run_appends_nav_and_saves_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(paper, "PAPER_DIR", tmp_path)
+    paper.init("acct", 100000.0)
+    close = _close()
+    volume = close * 0 + 1000.0
+    monkeypatch.setattr(paper, "universe_tickers", lambda: ["A", "B"])
+    paper.run("acct", fetch=lambda codes, window_days=0: (close, volume))
+    nav = pd.read_csv(tmp_path / "acct" / "nav.csv")
+    assert len(nav) == 1
+    state = paper.load_state("acct")
+    assert state["last_run"] == close.index[-1].strftime("%Y-%m-%d")
