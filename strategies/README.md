@@ -1,0 +1,20 @@
+# strategies — 经典量化策略 MVP
+
+6 个经典策略的最小实现,统一回测口径,教学/研究用途。
+设计文档:`docs/plans/2026-07-11-strategies-mvp-design.md`
+(分层概念对齐 zipline/pyfolio:data=bundle,signal=algorithm,
+backtest=execution+commission/slippage,metrics=tear sheet)。
+
+## 用法
+
+    # 先准备任一市场缓存
+    python -m alpha101.yf_history fetch --market us
+    # 单策略 / 全部对比
+    python -m strategies.run --market us --strategy momentum
+    python -m strategies.run --market us --all
+
+策略:ma_cross(双均线)、mean_reversion(均值回归)、momentum(动量)、
+market_neutral(市场中性多空)、pairs(配对套利)、ml(滚动逻辑回归)。
+
+口径:T 日收盘信号次日生效;换手计单边成本(默认 20bp);
+A 股做空为纸面模拟。研究用途,不构成投资建议。
