@@ -47,5 +47,13 @@
  },
  "days_since_rebalance": 0,
  "bench_nav": 100006.27128252025,
- "last_run": "2026-07-10"
+ "last_run": "2026-07-10",
+ "strategy": "momentum",
+ "market": "us",
+ "params": {
+  "top_n": 40,
+  "lookback": 126,
+  "skip": 21,
+  "rebalance": 21
+ }
 }

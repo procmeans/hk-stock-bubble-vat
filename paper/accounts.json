@@ -1,0 +1,12 @@
+[
+ {
+  "account": "us_momentum",
+  "title": "美股动量",
+  "currency": "$"
+ },
+ {
+  "account": "a_alpha101",
+  "title": "A股 Alpha101 全因子",
+  "currency": "¥"
+ }
+]
