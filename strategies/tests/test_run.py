@@ -1,11 +1,12 @@
 import pandas as pd
 
 
-def test_registry_has_all_nine_strategies():
+def test_registry_has_all_strategies():
     from strategies.run import REGISTRY
     assert set(REGISTRY) == {
         "ma_cross", "mean_reversion", "momentum", "market_neutral",
         "pairs", "ml", "elastic_net", "icir_weight", "lasso",
+        "alpha101_composite",
     }
 
 

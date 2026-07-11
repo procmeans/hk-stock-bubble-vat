@@ -6,11 +6,12 @@ import pandas as pd
 
 from strategies import backtest, data, metrics
 from strategies import (
-    elastic_net, icir_weight, lasso, ma_cross, market_neutral,
-    mean_reversion, ml, momentum, pairs,
+    alpha101_composite, elastic_net, icir_weight, lasso, ma_cross,
+    market_neutral, mean_reversion, ml, momentum, pairs,
 )
 
 REGISTRY = {
+    "alpha101_composite": alpha101_composite.signal,
     "ma_cross": ma_cross.signal,
     "mean_reversion": mean_reversion.signal,
     "momentum": momentum.signal,
