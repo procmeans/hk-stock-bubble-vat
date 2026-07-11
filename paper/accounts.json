@@ -8,5 +8,10 @@
   "account": "a_alpha101",
   "title": "A股 Alpha101 全因子",
   "currency": "¥"
+ },
+ {
+  "account": "a_equal_weight",
+  "title": "A股 流动性500等权",
+  "currency": "¥"
  }
 ]

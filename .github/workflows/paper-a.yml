@@ -29,8 +29,8 @@ jobs:
       - name: Install deps
         run: pip install pandas numpy scipy requests
 
-      - name: Run paper trading step (A-share alpha101)
-        run: python -m strategies.paper run --account a_alpha101
+      - name: Run paper trading step (all A-share accounts)
+        run: python -m strategies.paper run-market --market a
 
       - name: Commit & push state
         run: |
