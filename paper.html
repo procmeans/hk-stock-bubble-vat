@@ -19,6 +19,10 @@
   header h1{margin:0;font-size:21px;font-weight:700;letter-spacing:1px}
   header p{margin:6px 0 0;font-size:12.5px;color:var(--ink-2)}
   header .nav{margin-top:4px;font-size:12.5px}
+  #accts{display:flex;gap:6px;margin-top:12px}
+  #accts button{background:transparent;color:#9fb4d4;border:1px solid transparent;
+    border-radius:7px;padding:6px 12px;font-size:13px;cursor:pointer}
+  #accts button.on{background:#2b3a55;color:#fff;border-color:rgba(140,180,240,.35)}
   #tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:22px 0}
   .tile{background:var(--panel);border:1px solid var(--ring);border-radius:12px;padding:12px 14px}
   .tile .k{font-size:12px;color:var(--ink-2)}
@@ -48,10 +52,11 @@
 <body>
 <div id="page">
   <header>
-    <h1>模拟盘 · 美股动量</h1>
-    <p>momentum(126 日动量 · top 40 等权 · 每 21 交易日调仓)· 虚拟资金 $100,000 · 单边 20bp</p>
+    <h1 id="title">模拟盘</h1>
+    <p id="desc">虚拟资金 100,000 · 单边 20bp · T+1 收盘成交</p>
     <p class="nav"><a href="index.html">← 估值气泡缸</a> ·
-      <a href="https://github.com/procmeans/hk-stock-bubble-vat/tree/main/paper/us_momentum">状态文件与订单流水</a></p>
+      <a id="repolink" href="https://github.com/procmeans/hk-stock-bubble-vat/tree/main/paper">状态文件与订单流水</a></p>
+    <div id="accts"></div>
   </header>
 
   <div id="tiles"></div>
@@ -78,8 +83,15 @@
 </div>
 
 <script>
-const fmt$ = v => '$' + Number(v).toLocaleString('en-US', {maximumFractionDigits: 0});
+let CUR = '$';
+const fmt$ = v => CUR + Number(v).toLocaleString('en-US', {maximumFractionDigits: 0});
 const fmtPct = v => (v >= 0 ? '+' : '') + (v * 100).toFixed(2) + '%';
+
+const DESC = {
+  us_momentum: 'momentum(126 日动量 · top 40 等权 · 每 21 交易日调仓)· 虚拟资金 $100,000 · 单边 20bp',
+  a_alpha101: 'alpha101 全因子 IC 加权组合(top 50 等权 · 每 5 交易日调仓)· 虚拟资金 ¥100,000 · 单边 20bp · ' +
+    '注:4 年历史检验显著跑输等权基准(t=-4.2),上盘为延长检验',
+};
 
 function parseCSV(text) {
   const lines = text.trim().split(/\r?\n/);
@@ -201,13 +213,23 @@ function renderOrders(orders) {
     '</tbody></table>';
 }
 
-async function boot() {
+async function load(entry) {
+  CUR = entry.currency || '$';
+  document.getElementById('title').textContent = '模拟盘 · ' + entry.title;
+  document.getElementById('desc').textContent =
+    DESC[entry.account] || '虚拟资金 100,000 · 单边 20bp · T+1 收盘成交';
+  document.getElementById('repolink').href =
+    'https://github.com/procmeans/hk-stock-bubble-vat/tree/main/paper/' + entry.account;
+  document.querySelectorAll('#accts button').forEach(b =>
+    b.classList.toggle('on', b.dataset.account === entry.account));
+  document.getElementById('tiles').innerHTML = '';
+  document.getElementById('ordertable').innerHTML = '';
   try {
-    const bust = '?t=' + Date.now();
+    const base = 'paper/' + entry.account + '/', bust = '?t=' + Date.now();
     const [navText, ordText, state] = await Promise.all([
-      fetch('paper/us_momentum/nav.csv' + bust).then(r => r.text()),
-      fetch('paper/us_momentum/orders.csv' + bust).then(r => r.text()),
-      fetch('paper/us_momentum/state.json' + bust).then(r => r.json()).catch(() => null),
+      fetch(base + 'nav.csv' + bust).then(r => r.text()),
+      fetch(base + 'orders.csv' + bust).then(r => r.text()),
+      fetch(base + 'state.json' + bust).then(r => r.json()).catch(() => null),
     ]);
     const nav = parseCSV(navText).map(r => ({...r, nav: +r.nav, bench_nav: +r.bench_nav}));
     if (!nav.length) {
@@ -220,6 +242,26 @@ async function boot() {
   } catch (e) {
     document.getElementById('chart').innerHTML = '<div id="error">数据加载失败:' + e.message + '</div>';
   }
+}
+
+async function boot() {
+  let accounts;
+  try {
+    accounts = await fetch('paper/accounts.json?t=' + Date.now()).then(r => r.json());
+  } catch (e) {
+    accounts = [{account: 'us_momentum', title: '美股动量', currency: '$'}];
+  }
+  const bar = document.getElementById('accts');
+  bar.innerHTML = accounts.map(a =>
+    `<button data-account="${a.account}">${a.title}</button>`).join('');
+  bar.addEventListener('click', ev => {
+    const acc = ev.target.dataset && ev.target.dataset.account;
+    if (!acc) return;
+    location.hash = acc;
+    load(accounts.find(a => a.account === acc));
+  });
+  const wanted = location.hash.slice(1);
+  load(accounts.find(a => a.account === wanted) || accounts[0]);
 }
 boot();
 </script>
