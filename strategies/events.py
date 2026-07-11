@@ -42,16 +42,25 @@ def quarter_ends(start: str) -> list:
     return [d.strftime("%Y-%m-%d") for d in ends]
 
 
-def fetch_events(start: str = "2022-06-30", pause: float = 0.3) -> pd.DataFrame:
+def _get_json(url: str, retries: int = 4, timeout: int = 30) -> dict:
     import requests
 
+    for attempt in range(retries):
+        try:
+            return requests.get(url, timeout=timeout).json()
+        except requests.RequestException:
+            if attempt == retries - 1:
+                raise
+            time.sleep(2 ** attempt)
+    raise RuntimeError("unreachable")
+
+
+def fetch_events(start: str = "2022-06-30", pause: float = 0.5) -> pd.DataFrame:
     rows = []
     for report in quarter_ends(start):
         page = 1
         while True:
-            response = requests.get(API.format(page=page, report=report),
-                                    timeout=30)
-            payload = response.json()
+            payload = _get_json(API.format(page=page, report=report))
             rows.extend(parse_forecast_page(payload))
             pages = (payload.get("result") or {}).get("pages") or 1
             if page >= pages:
