@@ -125,6 +125,43 @@ def test_init_registers_account_manifest(tmp_path, monkeypatch):
     assert state["params"] == paper.A101_PARAMS
 
 
+def test_step_dispatches_equal_weight(monkeypatch):
+    import strategies.equal_weight as ew
+    monkeypatch.setattr(ew, "targets", lambda panel, **kw: {"B": 1.0})
+    state = _state()
+    state["strategy"] = "equal_weight"
+    state["params"] = {"top_n": 1, "rebalance": 5}
+
+    state, _, _ = paper.step(state, {"close": _close()})
+
+    assert state["pending_targets"] == {"B": 1.0}
+
+
+def test_run_market_shares_one_fetch(tmp_path, monkeypatch):
+    monkeypatch.setattr(paper, "PAPER_DIR", tmp_path)
+    small = {"top_n": 1, "lookback": 10, "skip": 2, "rebalance": 5}
+    paper.init("a_one", 100000.0, strategy="momentum", market="a", params=small)
+    paper.init("a_two", 100000.0, strategy="momentum", market="a", params=small)
+    paper.init("us_x", 100000.0, strategy="momentum", market="us")
+    close = _close()
+    panel = {"close": close, "volume": close * 0 + 1000.0,
+             "amount": close * 1000.0, "returns": close.pct_change()}
+    calls = []
+
+    def fake_fetch(codes, window_days=0):
+        calls.append(list(codes))
+        return panel
+
+    monkeypatch.setattr(paper, "a_universe_tickers", lambda: ["A", "B"])
+    paper.run_market("a", fetch=fake_fetch)
+
+    assert len(calls) == 1                     # 一次抓数,共用面板
+    today = close.index[-1].strftime("%Y-%m-%d")
+    assert paper.load_state("a_one")["last_run"] == today
+    assert paper.load_state("a_two")["last_run"] == today
+    assert paper.load_state("us_x")["last_run"] is None   # 非本市场不动
+
+
 def test_run_a_market_uses_amount_pool(tmp_path, monkeypatch):
     monkeypatch.setattr(paper, "PAPER_DIR", tmp_path)
     paper.init("acct2", 100000.0, strategy="momentum", market="a",

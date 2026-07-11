@@ -15,6 +15,9 @@ from strategies import momentum
 
 PARAMS = {"top_n": 40, "lookback": 126, "skip": 21, "rebalance": 21}
 A101_PARAMS = {"top_n": 50, "rebalance": 5}
+EW_PARAMS = {"top_n": 500, "rebalance": 5}
+DEFAULT_PARAMS = {"momentum": PARAMS, "alpha101": A101_PARAMS,
+                  "equal_weight": EW_PARAMS}
 COST_BPS = 20.0
 UNIVERSE_SIZE = 500
 FETCH_SIZE = 800
@@ -57,7 +60,7 @@ def init(account: str = "us_momentum", capital: float = 100000.0,
         "positions": {}, "pending_targets": None,
         "days_since_rebalance": None, "bench_nav": capital, "last_run": None,
         "strategy": strategy, "market": market,
-        "params": params or (A101_PARAMS if strategy == "alpha101" else PARAMS),
+        "params": params or DEFAULT_PARAMS.get(strategy, PARAMS),
     })
     register_account(account, title=title, currency=CURRENCIES.get(market, "$"))
     pd.DataFrame(columns=["date", "nav", "cash", "positions_value", "bench_nav"]) \
@@ -86,6 +89,9 @@ def positions_value(positions: dict, prices) -> float:
 def compute_targets(strategy: str, panel: dict, params: dict) -> dict:
     if strategy == "alpha101":
         from strategies.alpha101_composite import targets
+        return targets(panel, **params)
+    if strategy == "equal_weight":
+        from strategies.equal_weight import targets
         return targets(panel, **params)
     return target_weights(panel["close"], **params)
 
@@ -214,28 +220,30 @@ def fetch_close_volume(codes, window_days: int = WINDOW_DAYS):
     return close, volume
 
 
-def run(account: str = "us_momentum", fetch=None) -> None:
-    state = load_state(account)
-    market = state.get("market", "us")
-    held = set(state["positions"]) | set(state["pending_targets"] or {})
+def _market_panel(market: str, held: set, fetch=None) -> dict:
     if market == "a":
         codes = sorted(set(a_universe_tickers()) | held)
         panel = (fetch or fetch_a_panel)(codes, window_days=WINDOW_DAYS)
         adv = panel["amount"].tail(60).mean().nlargest(UNIVERSE_SIZE).index
         keep = set(adv) | held
-        panel = {key: value[[c for c in value.columns if c in keep]]
-                 if isinstance(value, pd.DataFrame) else value
-                 for key, value in panel.items()}
-    else:
-        codes = sorted(set(universe_tickers()) | held)
-        close, volume = (fetch or fetch_close_volume)(codes, window_days=WINDOW_DAYS)
-        adv = (close * volume).tail(60).mean().nlargest(UNIVERSE_SIZE).index
-        keep = set(adv) | held
-        panel = {"close": close[[code for code in close.columns if code in keep]]}
+        return {key: value[[c for c in value.columns if c in keep]]
+                if isinstance(value, pd.DataFrame) else value
+                for key, value in panel.items()}
+    codes = sorted(set(universe_tickers()) | held)
+    close, volume = (fetch or fetch_close_volume)(codes, window_days=WINDOW_DAYS)
+    adv = (close * volume).tail(60).mean().nlargest(UNIVERSE_SIZE).index
+    keep = set(adv) | held
+    return {"close": close[[code for code in close.columns if code in keep]]}
 
+
+def _held(state: dict) -> set:
+    return set(state["positions"]) | set(state["pending_targets"] or {})
+
+
+def _step_and_persist(account: str, state: dict, panel: dict) -> None:
     state, nav_row, orders = step(state, panel)
     if nav_row is None:
-        print(f"{state['last_run']} 已运行过,跳过")
+        print(f"{account}: {state['last_run']} 已运行过,跳过")
         return
     directory = account_dir(account)
     pd.DataFrame([nav_row]).to_csv(directory / "nav.csv", mode="a",
@@ -245,9 +253,34 @@ def run(account: str = "us_momentum", fetch=None) -> None:
                                     header=False, index=False)
     save_state(account, state)
     pending = len(state["pending_targets"] or {})
-    print(f"{nav_row['date']}: NAV {nav_row['nav']:,.2f} "
+    print(f"{account} {nav_row['date']}: NAV {nav_row['nav']:,.2f} "
           f"(基准 {nav_row['bench_nav']:,.2f}),成交 {len(orders)} 笔,"
           f"挂单 {pending} 只")
+
+
+def run(account: str = "us_momentum", fetch=None) -> None:
+    state = load_state(account)
+    panel = _market_panel(state.get("market", "us"), _held(state), fetch=fetch)
+    _step_and_persist(account, state, panel)
+
+
+def run_market(market: str, fetch=None) -> None:
+    """同市场所有账户共用一次抓数(iFinD 配额不随账户数增长)。"""
+    manifest = PAPER_DIR / "accounts.json"
+    entries = json.loads(manifest.read_text()) if manifest.exists() else []
+    states = {
+        entry["account"]: load_state(entry["account"])
+        for entry in entries
+        if load_state(entry["account"]).get("market", "us") == market
+    }
+    if not states:
+        raise SystemExit(f"无 {market} 市场账户")
+    held = set()
+    for state in states.values():
+        held |= _held(state)
+    panel = _market_panel(market, held, fetch=fetch)
+    for account, state in states.items():
+        _step_and_persist(account, state, panel)
 
 
 def status(account: str = "us_momentum") -> None:
@@ -262,11 +295,11 @@ def status(account: str = "us_momentum") -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("cmd", choices=["init", "run", "status"])
+    parser.add_argument("cmd", choices=["init", "run", "run-market", "status"])
     parser.add_argument("--account", default="us_momentum")
     parser.add_argument("--capital", type=float, default=100000.0)
     parser.add_argument("--strategy", default="momentum",
-                        choices=["momentum", "alpha101"])
+                        choices=sorted(DEFAULT_PARAMS))
     parser.add_argument("--market", default="us", choices=["us", "hk", "a"])
     parser.add_argument("--title", default=None)
     args = parser.parse_args()
@@ -275,6 +308,8 @@ def main() -> None:
              market=args.market, title=args.title)
     elif args.cmd == "run":
         run(args.account)
+    elif args.cmd == "run-market":
+        run_market(args.market)
     else:
         status(args.account)
 
