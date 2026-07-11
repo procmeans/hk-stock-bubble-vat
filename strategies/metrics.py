@@ -4,6 +4,16 @@ import numpy as np
 TRADING_DAYS = 252
 
 
+def daily_sharpe(net) -> float:
+    """日收益序列的年化夏普(mean×252 / (std×√252));空或零波动返回 NaN。"""
+    if len(net) == 0:
+        return float("nan")
+    std = net.std(ddof=0)
+    if std == 0 or np.isnan(std):
+        return float("nan")
+    return float(net.mean() * TRADING_DAYS / (std * np.sqrt(TRADING_DAYS)))
+
+
 def summary(result) -> dict:
     net, equity = result["net"], result["equity"]
     n = max(len(net), 1)

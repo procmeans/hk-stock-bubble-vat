@@ -23,3 +23,11 @@ def test_summary_hand_computed():
     # 最大回撤:峰值 1.01 -> 谷底 1.01*0.98
     assert stats["max_drawdown"] == pytest.approx(-0.02)
     assert stats["annual_turnover"] == pytest.approx(1.5 * 252 / 4)
+
+
+def test_daily_sharpe_hand_computed():
+    net = pd.Series([0.01, -0.01, 0.02])
+    expected = net.mean() * 252 / (net.std(ddof=0) * np.sqrt(252))
+    assert metrics.daily_sharpe(net) == pytest.approx(expected)
+    assert np.isnan(metrics.daily_sharpe(pd.Series([0.01, 0.01])))  # std=0
+    assert np.isnan(metrics.daily_sharpe(pd.Series([], dtype=float)))
