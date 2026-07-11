@@ -5,3 +5,4 @@ akshare
 matplotlib
 pyarrow
 pytest
+yfinance
