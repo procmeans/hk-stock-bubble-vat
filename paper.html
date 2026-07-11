@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>模拟盘 · 美股动量</title>
+<style>
+  :root{
+    --surface:#0a0e1a; --panel:#10182b; --ink:#e8eef7; --ink-2:#8da2c0;
+    --muted:#5c6f8d; --grid:#1d2740; --baseline:#2b3a55; --ring:rgba(255,255,255,.08);
+    --s1:#3987e5; /* 策略 */ --s2:#199e70; /* 基准 */
+    --good:#0ca30c; --bad:#d03b3b;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--surface);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+  a{color:var(--ink-2)}
+  #page{max-width:980px;margin:0 auto;padding:28px 20px 60px}
+  header h1{margin:0;font-size:21px;font-weight:700;letter-spacing:1px}
+  header p{margin:6px 0 0;font-size:12.5px;color:var(--ink-2)}
+  header .nav{margin-top:4px;font-size:12.5px}
+  #tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:22px 0}
+  .tile{background:var(--panel);border:1px solid var(--ring);border-radius:12px;padding:12px 14px}
+  .tile .k{font-size:12px;color:var(--ink-2)}
+  .tile .v{font-size:22px;font-weight:700;margin-top:4px}
+  .tile .sub{font-size:11.5px;color:var(--muted);margin-top:2px}
+  .up{color:var(--good)} .down{color:var(--bad)}
+  #chartbox{background:var(--panel);border:1px solid var(--ring);border-radius:12px;padding:16px 14px 8px;position:relative}
+  #chartbox h2{margin:0 0 4px;font-size:14px;font-weight:600}
+  #legend{display:flex;gap:16px;font-size:12px;color:var(--ink-2);margin:4px 0 6px}
+  #legend .chip{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+  svg{display:block;width:100%;height:auto}
+  #tip{position:absolute;display:none;pointer-events:none;z-index:5;
+    background:rgba(10,15,28,.96);border:1px solid rgba(120,160,220,.4);border-radius:8px;
+    padding:8px 11px;font-size:12.5px;line-height:1.7;box-shadow:0 6px 24px rgba(0,0,0,.5)}
+  #tip b{color:#fff}
+  .num{font-variant-numeric:tabular-nums}
+  #orders{margin-top:26px}
+  #orders h2{font-size:14px;margin:0 0 8px}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th{color:var(--ink-2);font-weight:500;text-align:right;padding:6px 8px;border-bottom:1px solid var(--baseline)}
+  td{text-align:right;padding:5px 8px;border-bottom:1px solid var(--grid)}
+  th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}
+  #empty,#error{padding:40px 0;text-align:center;color:var(--ink-2);font-size:13.5px}
+  footer{margin-top:34px;font-size:11.5px;color:var(--muted);line-height:1.8}
+</style>
+</head>
+<body>
+<div id="page">
+  <header>
+    <h1>模拟盘 · 美股动量</h1>
+    <p>momentum(126 日动量 · top 40 等权 · 每 21 交易日调仓)· 虚拟资金 $100,000 · 单边 20bp</p>
+    <p class="nav"><a href="index.html">← 估值气泡缸</a> ·
+      <a href="https://github.com/procmeans/hk-stock-bubble-vat/tree/main/paper/us_momentum">状态文件与订单流水</a></p>
+  </header>
+
+  <div id="tiles"></div>
+
+  <div id="chartbox">
+    <h2>净值曲线(策略 vs 等权基准)</h2>
+    <div id="legend">
+      <span><i class="chip" style="background:var(--s1)"></i>策略净值</span>
+      <span><i class="chip" style="background:var(--s2)"></i>等权基准</span>
+    </div>
+    <div id="chart"></div>
+    <div id="tip"></div>
+  </div>
+
+  <div id="orders">
+    <h2>最近订单</h2>
+    <div id="ordertable"></div>
+  </div>
+
+  <footer>
+    口径:T 日收盘信号 → T+1 收盘成交;基准 = 股票池等权逐日再平衡;回撤 = 净值 / 历史峰值 − 1。<br>
+    数据由 GitHub Actions 每个交易日收盘后自动更新。纸面模拟,研究用途,不构成投资建议。
+  </footer>
+</div>
+
+<script>
+const fmt$ = v => '$' + Number(v).toLocaleString('en-US', {maximumFractionDigits: 0});
+const fmtPct = v => (v >= 0 ? '+' : '') + (v * 100).toFixed(2) + '%';
+
+function parseCSV(text) {
+  const lines = text.trim().split(/\r?\n/);
+  if (lines.length < 2) return [];
+  const head = lines[0].split(',');
+  return lines.slice(1).map(line => {
+    const cells = line.split(',');
+    const row = {};
+    head.forEach((h, i) => row[h] = cells[i]);
+    return row;
+  });
+}
+
+function drawdown(navs) {
+  let peak = -Infinity, worst = 0;
+  for (const v of navs) { peak = Math.max(peak, v); worst = Math.min(worst, v / peak - 1); }
+  return worst;
+}
+
+function tile(k, v, cls, sub) {
+  return `<div class="tile"><div class="k">${k}</div>` +
+         `<div class="v num ${cls || ''}">${v}</div>` +
+         (sub ? `<div class="sub">${sub}</div>` : '') + `</div>`;
+}
+
+function renderTiles(nav, state) {
+  const last = nav[nav.length - 1];
+  const capital = state ? state.capital : 100000;
+  const ret = last.nav / capital - 1;
+  const bench = last.bench_nav / capital - 1;
+  const dd = drawdown(nav.map(r => r.nav));
+  const held = state ? Object.keys(state.positions).length : '—';
+  document.getElementById('tiles').innerHTML =
+    tile('当前净值', fmt$(last.nav), '', '截至 ' + last.date) +
+    tile('累计收益', fmtPct(ret), ret >= 0 ? 'up' : 'down', '起始 $100,000') +
+    tile('相对基准', fmtPct(ret - bench), ret - bench >= 0 ? 'up' : 'down', '基准 ' + fmtPct(bench)) +
+    tile('最大回撤', fmtPct(dd), dd < 0 ? 'down' : '', '峰值回落') +
+    tile('持仓', held + ' 只', '', '现金 ' + (state ? fmt$(state.cash) : '—'));
+}
+
+function renderChart(nav) {
+  const W = 940, H = 320, m = {t: 14, r: 64, b: 26, l: 56};
+  const xs = nav.map(r => new Date(r.date + 'T00:00:00Z').getTime());
+  const series = [
+    {key: 'nav', color: 'var(--s1)', label: '策略'},
+    {key: 'bench_nav', color: 'var(--s2)', label: '基准'},
+  ];
+  const all = nav.flatMap(r => [r.nav, r.bench_nav]);
+  let lo = Math.min(...all), hi = Math.max(...all);
+  if (hi - lo < hi * 0.004) { const pad = hi * 0.004; lo -= pad; hi += pad; }
+  const x = t => xs.length > 1
+    ? m.l + (t - xs[0]) / (xs[xs.length - 1] - xs[0]) * (W - m.l - m.r)
+    : (m.l + W - m.r) / 2;
+  const y = v => m.t + (1 - (v - lo) / (hi - lo)) * (H - m.t - m.b);
+
+  const gridN = 4;
+  let g = '';
+  for (let i = 0; i <= gridN; i++) {
+    const v = lo + (hi - lo) * i / gridN, yy = y(v);
+    g += `<line x1="${m.l}" x2="${W - m.r}" y1="${yy}" y2="${yy}" stroke="var(--grid)"/>` +
+         `<text x="${m.l - 8}" y="${yy + 4}" text-anchor="end" font-size="10.5" fill="var(--muted)" class="num">${fmt$(v)}</text>`;
+  }
+  const t0 = new Date(xs[0]), t1 = new Date(xs[xs.length - 1]);
+  g += `<text x="${m.l}" y="${H - 8}" font-size="10.5" fill="var(--muted)">${t0.toISOString().slice(0, 10)}</text>`;
+  if (xs.length > 1)
+    g += `<text x="${W - m.r}" y="${H - 8}" text-anchor="end" font-size="10.5" fill="var(--muted)">${t1.toISOString().slice(0, 10)}</text>`;
+
+  let marks = '';
+  for (const s of series) {
+    const pts = nav.map((r, i) => `${x(xs[i]).toFixed(1)},${y(+r[s.key]).toFixed(1)}`);
+    if (nav.length > 1)
+      marks += `<polyline points="${pts.join(' ')}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round"/>`;
+    const lastR = nav[nav.length - 1];
+    const cx = x(xs[xs.length - 1]), cy = y(+lastR[s.key]);
+    marks += `<circle cx="${cx}" cy="${cy}" r="4" fill="${s.color}" stroke="var(--panel)" stroke-width="2"/>` +
+             `<text x="${cx + 9}" y="${cy + 4}" font-size="11" fill="${s.color}">${s.label}</text>`;
+  }
+
+  document.getElementById('chart').innerHTML =
+    `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="策略与基准净值曲线">` +
+    `<line x1="${m.l}" x2="${W - m.r}" y1="${H - m.b}" y2="${H - m.b}" stroke="var(--baseline)"/>` +
+    g + marks +
+    `<line id="xline" y1="${m.t}" y2="${H - m.b}" stroke="var(--ink-2)" stroke-dasharray="3 3" visibility="hidden"/>` +
+    `<rect id="hit" x="${m.l}" y="${m.t}" width="${W - m.l - m.r}" height="${H - m.t - m.b}" fill="transparent"/></svg>`;
+
+  const svg = document.querySelector('#chart svg');
+  const xline = svg.querySelector('#xline');
+  const tip = document.getElementById('tip');
+  svg.querySelector('#hit').addEventListener('mousemove', ev => {
+    const box = svg.getBoundingClientRect();
+    const px = (ev.clientX - box.left) / box.width * W;
+    let best = 0, dist = Infinity;
+    xs.forEach((t, i) => { const d = Math.abs(x(t) - px); if (d < dist) { dist = d; best = i; } });
+    const r = nav[best], cx = x(xs[best]);
+    xline.setAttribute('x1', cx); xline.setAttribute('x2', cx);
+    xline.setAttribute('visibility', 'visible');
+    const dd = drawdown(nav.slice(0, best + 1).map(q => q.nav));
+    tip.innerHTML = `<b>${r.date}</b><br>策略 <span class="num">${fmt$(r.nav)}</span><br>` +
+      `基准 <span class="num">${fmt$(r.bench_nav)}</span><br>回撤 <span class="num">${fmtPct(dd)}</span>`;
+    tip.style.display = 'block';
+    const bx = document.getElementById('chartbox').getBoundingClientRect();
+    tip.style.left = Math.min(ev.clientX - bx.left + 14, bx.width - 170) + 'px';
+    tip.style.top = (ev.clientY - bx.top - 10) + 'px';
+  });
+  svg.addEventListener('mouseleave', () => {
+    tip.style.display = 'none'; xline.setAttribute('visibility', 'hidden');
+  });
+}
+
+function renderOrders(orders) {
+  const el = document.getElementById('ordertable');
+  if (!orders.length) { el.innerHTML = '<div id="empty">尚无成交(首批挂单将在下一交易日收盘成交)</div>'; return; }
+  const recent = orders.slice(-30).reverse();
+  el.innerHTML = '<table><thead><tr><th>日期</th><th>代码</th><th>方向</th>' +
+    '<th>股数</th><th>价格</th><th>金额</th><th>费用</th></tr></thead><tbody>' +
+    recent.map(o => `<tr class="num"><td>${o.date}</td><td>${o.ticker}</td>` +
+      `<td>${o.side === 'buy' ? '买入' : '卖出'}</td><td>${(+o.shares).toFixed(2)}</td>` +
+      `<td>${(+o.price).toFixed(2)}</td><td>${fmt$(o.value)}</td><td>$${(+o.cost).toFixed(2)}</td></tr>`).join('') +
+    '</tbody></table>';
+}
+
+async function boot() {
+  try {
+    const bust = '?t=' + Date.now();
+    const [navText, ordText, state] = await Promise.all([
+      fetch('paper/us_momentum/nav.csv' + bust).then(r => r.text()),
+      fetch('paper/us_momentum/orders.csv' + bust).then(r => r.text()),
+      fetch('paper/us_momentum/state.json' + bust).then(r => r.json()).catch(() => null),
+    ]);
+    const nav = parseCSV(navText).map(r => ({...r, nav: +r.nav, bench_nav: +r.bench_nav}));
+    if (!nav.length) {
+      document.getElementById('chart').innerHTML = '<div id="empty">净值数据积累中,首个交易日后显示</div>';
+      return;
+    }
+    renderTiles(nav, state);
+    renderChart(nav);
+    renderOrders(parseCSV(ordText));
+  } catch (e) {
+    document.getElementById('chart').innerHTML = '<div id="error">数据加载失败:' + e.message + '</div>';
+  }
+}
+boot();
+</script>
+</body>
+</html>
