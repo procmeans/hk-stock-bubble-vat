@@ -5,7 +5,10 @@ from pathlib import Path
 import pandas as pd
 
 from strategies import backtest, data, metrics
-from strategies import ma_cross, market_neutral, mean_reversion, ml, momentum, pairs
+from strategies import (
+    elastic_net, icir_weight, lasso, ma_cross, market_neutral,
+    mean_reversion, ml, momentum, pairs,
+)
 
 REGISTRY = {
     "ma_cross": ma_cross.signal,
@@ -14,6 +17,9 @@ REGISTRY = {
     "market_neutral": market_neutral.signal,
     "pairs": pairs.signal,
     "ml": ml.signal,
+    "elastic_net": elastic_net.signal,
+    "icir_weight": icir_weight.signal,
+    "lasso": lasso.signal,
 }
 OUTPUT_DIR = Path("output/strategies")
 
