@@ -19,5 +19,14 @@ elastic_net(弹性网络选股)、icir_weight(ICIR 定权多因子)、
 lasso(Lasso 滚动选股)——后三个参照 BigQuant 文档,基本面因子以
 价量因子替代(面板无 point-in-time 基本面)。
 
+## 有效性验证与调参
+
+    python -m strategies.validate --market us --all                # 基准/超额/t检验
+    python -m strategies.validate --market us --strategy momentum  # 加分年表
+    python -m strategies.optimize --market us --strategy ma_cross  # 训练/留出调参
+
+结论口径:t≥2 显著跑赢;|t|<2 超额不显著(不能排除运气);
+优化的留出段只用一次,红牌参数勿采用。已退市股缺失 = 残余幸存者偏差。
+
 口径:T 日收盘信号次日生效;换手计单边成本(默认 20bp);
 A 股做空为纸面模拟。研究用途,不构成投资建议。
