@@ -14,11 +14,13 @@ import pandas as pd
 from strategies import momentum
 
 PARAMS = {"top_n": 40, "lookback": 126, "skip": 21, "rebalance": 21}
+A101_PARAMS = {"top_n": 50, "rebalance": 5}
 COST_BPS = 20.0
 UNIVERSE_SIZE = 500
 FETCH_SIZE = 800
 WINDOW_DAYS = 400
 PAPER_DIR = Path("paper")
+CURRENCIES = {"us": "$", "hk": "HK$", "a": "¥"}
 
 
 def account_dir(account: str) -> Path:
@@ -34,7 +36,18 @@ def save_state(account: str, state: dict) -> None:
         json.dumps(state, ensure_ascii=False, indent=1))
 
 
-def init(account: str = "us_momentum", capital: float = 100000.0) -> None:
+def register_account(account: str, title: str = None, currency: str = "$") -> None:
+    path = PAPER_DIR / "accounts.json"
+    entries = json.loads(path.read_text()) if path.exists() else []
+    if not any(entry["account"] == account for entry in entries):
+        entries.append({"account": account, "title": title or account,
+                        "currency": currency})
+        path.write_text(json.dumps(entries, ensure_ascii=False, indent=1))
+
+
+def init(account: str = "us_momentum", capital: float = 100000.0,
+         strategy: str = "momentum", market: str = "us",
+         params: dict = None, title: str = None) -> None:
     directory = account_dir(account)
     if (directory / "state.json").exists():
         raise SystemExit(f"账户已存在: {directory}")
@@ -43,7 +56,10 @@ def init(account: str = "us_momentum", capital: float = 100000.0) -> None:
         "account": account, "capital": capital, "cash": capital,
         "positions": {}, "pending_targets": None,
         "days_since_rebalance": None, "bench_nav": capital, "last_run": None,
+        "strategy": strategy, "market": market,
+        "params": params or (A101_PARAMS if strategy == "alpha101" else PARAMS),
     })
+    register_account(account, title=title, currency=CURRENCIES.get(market, "$"))
     pd.DataFrame(columns=["date", "nav", "cash", "positions_value", "bench_nav"]) \
         .to_csv(directory / "nav.csv", index=False)
     pd.DataFrame(columns=["date", "ticker", "side", "shares", "price", "value", "cost"]) \
@@ -67,8 +83,17 @@ def positions_value(positions: dict, prices) -> float:
     ))
 
 
-def step(state: dict, close, params=PARAMS, cost_bps=COST_BPS):
-    """处理 close 的最新一天;返回 (state, nav_row|None, orders)。幂等。"""
+def compute_targets(strategy: str, panel: dict, params: dict) -> dict:
+    if strategy == "alpha101":
+        from strategies.alpha101_composite import targets
+        return targets(panel, **params)
+    return target_weights(panel["close"], **params)
+
+
+def step(state: dict, panel: dict, params=None, cost_bps=COST_BPS):
+    """处理 panel(至少含 close)的最新一天;返回 (state, nav_row|None, orders)。幂等。"""
+    close = panel["close"]
+    params = params or state.get("params") or PARAMS
     today = close.index[-1]
     today_str = today.strftime("%Y-%m-%d")
     if state["last_run"] == today_str:
@@ -120,9 +145,9 @@ def step(state: dict, close, params=PARAMS, cost_bps=COST_BPS):
         state["days_since_rebalance"] += 1
         due = state["days_since_rebalance"] >= params["rebalance"]
     if due:
-        targets = target_weights(close, **params)
-        if targets:
-            state["pending_targets"] = targets
+        new_targets = compute_targets(state.get("strategy", "momentum"), panel, params)
+        if new_targets:
+            state["pending_targets"] = new_targets
             state["days_since_rebalance"] = 0
 
     state["last_run"] = today_str
@@ -135,6 +160,36 @@ def universe_tickers(snapshot_dir: Path = Path("data")) -> list:
     rows = json.loads(default_universe("us", snapshot_dir).read_text())
     top = sorted(rows, key=lambda row: row.get("mc") or 0, reverse=True)[:FETCH_SIZE]
     return [row["code"] for row in top]
+
+
+def a_universe_tickers(snapshot_dir: Path = Path("data")) -> list:
+    """当日 A 股快照按市值取前 FETCH_SIZE。"""
+    dates = json.loads((snapshot_dir / "manifest_a.json").read_text())["dates"]
+    rows = json.loads((snapshot_dir / f"a-{max(dates)}.json").read_text())
+    top = sorted(rows, key=lambda row: row.get("mc") or 0, reverse=True)[:FETCH_SIZE]
+    return [str(row["code"]).zfill(6) for row in top]
+
+
+def fetch_a_panel(codes, window_days: int = WINDOW_DAYS) -> dict:
+    """iFinD 抓 OHLCV+amount 并构建 alpha101 口径面板。"""
+    from alpha101 import ths_http
+    from alpha101.ths_history import build_panel, normalize_history_frame
+    from alpha101.ths_today import chunks, to_thscode
+
+    start = (pd.Timestamp.today() - pd.Timedelta(days=window_days)).strftime("%Y-%m-%d")
+    end = pd.Timestamp.today().strftime("%Y-%m-%d")
+    token = ths_http.get_access_token()
+    frames = []
+    for batch in chunks([to_thscode(code) for code in codes], 25):
+        data = ths_http.history_quotation(
+            batch, "open,high,low,close,volume,amount", start, end,
+            access_token=token)
+        if not data.empty:
+            frames.append(normalize_history_frame(data))
+    if not frames:
+        raise RuntimeError("iFinD 未返回任何数据")
+    raw = pd.concat(frames, ignore_index=True).drop_duplicates(["code", "date"])
+    return build_panel(raw)
 
 
 def fetch_close_volume(codes, window_days: int = WINDOW_DAYS):
@@ -160,16 +215,25 @@ def fetch_close_volume(codes, window_days: int = WINDOW_DAYS):
 
 
 def run(account: str = "us_momentum", fetch=None) -> None:
-    fetch = fetch or fetch_close_volume
     state = load_state(account)
+    market = state.get("market", "us")
     held = set(state["positions"]) | set(state["pending_targets"] or {})
-    codes = sorted(set(universe_tickers()) | held)
-    close, volume = fetch(codes, window_days=WINDOW_DAYS)
-    adv = (close * volume).tail(60).mean().nlargest(UNIVERSE_SIZE).index
-    keep = set(adv) | held
-    pool = close[[code for code in close.columns if code in keep]]
+    if market == "a":
+        codes = sorted(set(a_universe_tickers()) | held)
+        panel = (fetch or fetch_a_panel)(codes, window_days=WINDOW_DAYS)
+        adv = panel["amount"].tail(60).mean().nlargest(UNIVERSE_SIZE).index
+        keep = set(adv) | held
+        panel = {key: value[[c for c in value.columns if c in keep]]
+                 if isinstance(value, pd.DataFrame) else value
+                 for key, value in panel.items()}
+    else:
+        codes = sorted(set(universe_tickers()) | held)
+        close, volume = (fetch or fetch_close_volume)(codes, window_days=WINDOW_DAYS)
+        adv = (close * volume).tail(60).mean().nlargest(UNIVERSE_SIZE).index
+        keep = set(adv) | held
+        panel = {"close": close[[code for code in close.columns if code in keep]]}
 
-    state, nav_row, orders = step(state, pool)
+    state, nav_row, orders = step(state, panel)
     if nav_row is None:
         print(f"{state['last_run']} 已运行过,跳过")
         return
@@ -201,9 +265,14 @@ def main() -> None:
     parser.add_argument("cmd", choices=["init", "run", "status"])
     parser.add_argument("--account", default="us_momentum")
     parser.add_argument("--capital", type=float, default=100000.0)
+    parser.add_argument("--strategy", default="momentum",
+                        choices=["momentum", "alpha101"])
+    parser.add_argument("--market", default="us", choices=["us", "hk", "a"])
+    parser.add_argument("--title", default=None)
     args = parser.parse_args()
     if args.cmd == "init":
-        init(args.account, args.capital)
+        init(args.account, args.capital, strategy=args.strategy,
+             market=args.market, title=args.title)
     elif args.cmd == "run":
         run(args.account)
     else:
