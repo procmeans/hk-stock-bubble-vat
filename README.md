@@ -37,6 +37,12 @@
 
 ---
 
+## 分析记录
+
+- [2026-07-13 A 股涨停股动量分析](docs/analysis/2026-07-13-limit-up-momentum.md):基于同花顺涨停池接口,对 2026-07-10 涨停股做次交易日续板概率排序与盘中复盘。
+
+---
+
 ## 自动化
 
 `GitHub Actions`(`.github/workflows/update.yml`)每天定时运行:
