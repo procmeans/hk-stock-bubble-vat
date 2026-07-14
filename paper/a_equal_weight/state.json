@@ -505,9 +505,9 @@
   "688981": 1.2226433549333657
  },
  "pending_targets": null,
- "days_since_rebalance": 1,
- "bench_nav": 93115.25268906045,
- "last_run": "2026-07-13",
+ "days_since_rebalance": 2,
+ "bench_nav": 95095.62166562406,
+ "last_run": "2026-07-14",
  "strategy": "equal_weight",
  "market": "a",
  "params": {
