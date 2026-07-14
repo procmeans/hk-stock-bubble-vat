@@ -45,9 +45,9 @@
   "WDC": 4.500045099328937
  },
  "pending_targets": null,
- "days_since_rebalance": 1,
- "bench_nav": 99405.4259181437,
- "last_run": "2026-07-13",
+ "days_since_rebalance": 2,
+ "bench_nav": 99458.07831590048,
+ "last_run": "2026-07-14",
  "strategy": "momentum",
  "market": "us",
  "params": {
