@@ -1,0 +1,6 @@
+{
+ "account": "a_ths_heat_rise", "capital": 100000.0, "cash": 100000.0,
+ "positions": {}, "pending_targets": null, "days_since_rebalance": null,
+ "bench_nav": 100000.0, "last_run": null, "strategy": "ths_heat_rise",
+ "market": "a", "params": {"top_n": 20, "rebalance": 2}
+}

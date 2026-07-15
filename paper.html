@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>模拟盘 · 美股动量</title>
+<title>模拟盘 · 五策略</title>
 <style>
   :root{
     --surface:#0a0e1a; --panel:#10182b; --ink:#e8eef7; --ink-2:#8da2c0;
@@ -93,6 +93,10 @@ const DESC = {
     '注:4 年历史检验显著跑输等权基准(t=-4.2),上盘为延长检验',
   a_equal_weight: '流动性前 500 等权 · 每 5 交易日再平衡 · 虚拟资金 ¥100,000 · 单边 20bp · ' +
     '注:近 4 年事实冠军风格,但小微盘拥挤、历史含 2024-02 式雪崩回撤,且幸存者偏差使历史数字偏乐观',
+  a_ths_heat: '同花顺个股热度 top 20 等权 · 每 2 交易日调仓 · 虚拟资金 ¥100,000 · 单边 20bp · ' +
+    '注:热度反映市场关注而非已验证正向 alpha,高关注可能伴随过度反应',
+  a_ths_heat_rise: '同花顺个股热度排名环比增长率 top 20 等权 · 每 2 交易日调仓 · ' +
+    '虚拟资金 ¥100,000 · 单边 20bp · 注:信号短期且换手可能较高',
 };
 
 function parseCSV(text) {
@@ -128,7 +132,7 @@ function renderTiles(nav, state) {
   const held = state ? Object.keys(state.positions).length : '—';
   document.getElementById('tiles').innerHTML =
     tile('当前净值', fmt$(last.nav), '', '截至 ' + last.date) +
-    tile('累计收益', fmtPct(ret), ret >= 0 ? 'up' : 'down', '起始 $100,000') +
+    tile('累计收益', fmtPct(ret), ret >= 0 ? 'up' : 'down', '起始 ' + fmt$(capital)) +
     tile('相对基准', fmtPct(ret - bench), ret - bench >= 0 ? 'up' : 'down', '基准 ' + fmtPct(bench)) +
     tile('最大回撤', fmtPct(dd), dd < 0 ? 'down' : '', '峰值回落') +
     tile('持仓', held + ' 只', '', '现金 ' + (state ? fmt$(state.cash) : '—'));
@@ -211,7 +215,7 @@ function renderOrders(orders) {
     '<th>股数</th><th>价格</th><th>金额</th><th>费用</th></tr></thead><tbody>' +
     recent.map(o => `<tr class="num"><td>${o.date}</td><td>${o.ticker}</td>` +
       `<td>${o.side === 'buy' ? '买入' : '卖出'}</td><td>${(+o.shares).toFixed(2)}</td>` +
-      `<td>${(+o.price).toFixed(2)}</td><td>${fmt$(o.value)}</td><td>$${(+o.cost).toFixed(2)}</td></tr>`).join('') +
+      `<td>${(+o.price).toFixed(2)}</td><td>${fmt$(o.value)}</td><td>${fmt$(o.cost)}</td></tr>`).join('') +
     '</tbody></table>';
 }
 

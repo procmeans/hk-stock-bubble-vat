@@ -1,6 +1,8 @@
 """Thin iFinD HTTP API client used by the Alpha101 tools."""
 
+import math
 import os
+import re
 from typing import Optional
 
 import pandas as pd
@@ -8,6 +10,11 @@ import requests
 
 BASE_URL = "https://quantapi.51ifind.com/api/v1"
 REFRESH_TOKEN_ENV = "THS_HTTP_REFRESH_TOKEN"
+_MAX_ERROR_CODE_CHARS = 32
+_MAX_ERROR_CODE_INT_BITS = 107
+_NUMERIC_ERROR_CODE_RE = re.compile(
+    r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
+)
 
 
 def get_access_token(refresh_token: Optional[str] = None, timeout: int = 15) -> str:
@@ -100,17 +107,58 @@ def history_quotation(
     return tables_to_dataframe(data)
 
 
+def smart_stock_picking(
+    searchstring: str,
+    searchtype: str = "stock",
+    access_token: Optional[str] = None,
+    refresh_token: Optional[str] = None,
+    timeout: int = 30,
+) -> pd.DataFrame:
+    """Run an iFinD semantic stock query and return a flat DataFrame."""
+    data = post(
+        "smart_stock_picking",
+        {"searchstring": searchstring, "searchtype": searchtype},
+        access_token=access_token,
+        refresh_token=refresh_token,
+        timeout=timeout,
+    )
+    return tables_to_dataframe(data)
+
+
 def join_if_sequence(value):
     if isinstance(value, (list, tuple)):
         return ",".join(value)
     return value
 
 
+def _safe_error_code(value) -> str:
+    if isinstance(value, bool):
+        return "unknown"
+    if isinstance(value, int):
+        if value.bit_length() > _MAX_ERROR_CODE_INT_BITS:
+            return "unknown"
+        rendered = str(value)
+        return rendered if len(rendered) <= _MAX_ERROR_CODE_CHARS else "unknown"
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return "unknown"
+        rendered = str(value)
+        return rendered if len(rendered) <= _MAX_ERROR_CODE_CHARS else "unknown"
+    if isinstance(value, str):
+        value = value.strip()
+        if (len(value) <= _MAX_ERROR_CODE_CHARS
+                and _NUMERIC_ERROR_CODE_RE.fullmatch(value)):
+            return value
+    return "unknown"
+
+
 def raise_for_api_error(payload: dict) -> None:
     errorcode = payload.get("errorcode", payload.get("errcode", 0))
     if errorcode not in (0, "0", None):
-        errmsg = payload.get("errmsg") or payload.get("message") or str(payload)
-        raise RuntimeError(errmsg)
+        message = payload.get("errmsg") or payload.get("message")
+        if not isinstance(message, str) or not message.strip():
+            message = f"iFinD HTTP API error {_safe_error_code(errorcode)}"
+        raise RuntimeError(message)
 
 
 def tables_to_dataframe(payload: dict) -> pd.DataFrame:
