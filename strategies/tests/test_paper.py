@@ -631,6 +631,7 @@ def test_error_sanitizer_redacts_quoted_and_bare_authorization_keys(
     tmp_path, message, secret
 ):
     summary = paper.sanitize_error(RuntimeError(message))
+    resanitized = paper.sanitize_error(summary)
     row = paper._error_row("2026-07-15", "ths_heat", RuntimeError(message))
     paper.append_heat_signals([row], path=tmp_path / "ths_heat_signals.csv")
     persisted = (tmp_path / "ths_heat_signals.csv").read_text()
@@ -639,6 +640,19 @@ def test_error_sanitizer_redacts_quoted_and_bare_authorization_keys(
     assert secret not in persisted
     assert summary.count("[REDACTED]") == 1
     assert "[REDACTED]]" not in summary
+    assert resanitized == summary
+    assert "[REDACTED]]" not in resanitized
+
+
+def test_configured_token_authorization_replacement_is_idempotent(monkeypatch):
+    monkeypatch.setenv("THS_HTTP_REFRESH_TOKEN", "configured-short")
+
+    summary = paper.sanitize_error("authorization: configured-short")
+    resanitized = paper.sanitize_error(summary)
+
+    assert summary == "authorization: [REDACTED]"
+    assert resanitized == summary
+    assert "[REDACTED]]" not in resanitized
 
 
 def test_run_market_aggregate_redacts_credentials(tmp_path, monkeypatch):
@@ -664,6 +678,8 @@ def test_run_market_aggregate_redacts_credentials(tmp_path, monkeypatch):
     assert "acct" in summary and "[REDACTED]" in summary
     assert "aggregate-auth-secret" not in summary
     assert "configured-aggregate-secret" not in summary
+    assert "[REDACTED]]" not in summary
+    assert paper.sanitize_error(summary) == summary
 
 
 def test_run_market_bounds_complete_multi_account_failure_summary(

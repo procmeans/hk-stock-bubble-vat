@@ -41,13 +41,13 @@ _QUOTED_CREDENTIAL_RE = re.compile(
     flags=re.IGNORECASE | re.DOTALL,
 )
 _UNQUOTED_AUTHORIZATION_RE = re.compile(
-    r"([\"']?\bauthorization\b[\"']?\s*[:=]\s*)"
-    r"(?!\[REDACTED\])[^,;}\]\r\n]+",
+    r"([\"']?\bauthorization\b[\"']?\s*[:=])"
+    r"(?!\s*\[REDACTED\])(\s*)[^,;}\]\r\n]+",
     flags=re.IGNORECASE,
 )
 _PLAIN_CREDENTIAL_RE = re.compile(
-    rf"(\b{_CREDENTIAL_FIELD}\b\s*[:=]\s*)"
-    rf"(?!\[REDACTED\])(?:Bearer\s+)?[^\s,;}}\]]+",
+    rf"(\b{_CREDENTIAL_FIELD}\b\s*[:=])"
+    rf"(?!\s*\[REDACTED\])(\s*)(?:Bearer\s+)?[^\s,;}}\]]+",
     flags=re.IGNORECASE,
 )
 _BEARER_RE = re.compile(
@@ -356,8 +356,8 @@ def sanitize_error(error, limit=ERROR_SUMMARY_LIMIT):
     if configured_token:
         text = text.replace(configured_token, "[REDACTED]")
     text = _QUOTED_CREDENTIAL_RE.sub(r"\1[REDACTED]", text)
-    text = _UNQUOTED_AUTHORIZATION_RE.sub(r"\1[REDACTED]", text)
-    text = _PLAIN_CREDENTIAL_RE.sub(r"\1[REDACTED]", text)
+    text = _UNQUOTED_AUTHORIZATION_RE.sub(r"\1\2[REDACTED]", text)
+    text = _PLAIN_CREDENTIAL_RE.sub(r"\1\2[REDACTED]", text)
     text = _BEARER_RE.sub("Bearer [REDACTED]", text)
     text = _TOKEN_LIKE_RE.sub("[REDACTED]", text)
     return " ".join(text.split())[:limit]
