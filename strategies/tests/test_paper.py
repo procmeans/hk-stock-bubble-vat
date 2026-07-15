@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 from strategies import paper
+from strategies import ths_attention_combo
 
 SMALL = {"top_n": 1, "lookback": 10, "skip": 2, "rebalance": 5}
 
@@ -733,3 +734,224 @@ def test_paper_dashboard_formats_capital_and_cost_with_account_currency():
     assert "<td>${fmt$(o.cost)}</td>" in html
     assert "'起始 $100,000'" not in html
     assert "<td>$${(+o.cost).toFixed(2)}</td>" not in html
+
+
+def _attention_candidates(tickers=("A", "B")):
+    return pd.DataFrame([
+        {
+            "date": "2024-04-19", "ticker": ticker, "name": ticker,
+            "attention_rise": 100.0 - index,
+            "float_a": 10.0 + index * 10.0, "total_shares": 100.0,
+        }
+        for index, ticker in enumerate(tickers)
+    ], columns=ths_attention_combo.CANDIDATE_COLUMNS)
+
+
+def test_run_market_shares_one_attention_query_between_two_accounts(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(paper, "PAPER_DIR", tmp_path)
+    params = {"top_n": 20, "candidate_n": 100,
+              "rebalance": 2, "min_history": 60}
+    paper.init("weighted", 100000.0, strategy="ths_attention_weighted",
+               market="a", params=params)
+    paper.init("funnel", 100000.0, strategy="ths_attention_funnel",
+               market="a", params=params)
+    monkeypatch.setattr(paper, "a_universe_tickers", lambda: ["A", "B"])
+    calls = []
+
+    def fake_candidates(day, candidate_n=100):
+        calls.append((day.strftime("%Y-%m-%d"), candidate_n))
+        return _attention_candidates()
+
+    panel = _a_panel(n=80)
+    paper.run_market(
+        "a", fetch=lambda codes, window_days=0: panel,
+        attention_fetch=fake_candidates,
+    )
+    assert calls == [(panel["close"].index[-1].strftime("%Y-%m-%d"), 100)]
+    assert paper.load_state("weighted")["pending_targets"]
+    assert paper.load_state("funnel")["pending_targets"]
+
+
+def test_non_due_attention_accounts_do_not_query(tmp_path, monkeypatch):
+    monkeypatch.setattr(paper, "PAPER_DIR", tmp_path)
+    for account, strategy in [
+        ("weighted", "ths_attention_weighted"),
+        ("funnel", "ths_attention_funnel"),
+    ]:
+        paper.init(account, 100000.0, strategy=strategy, market="a")
+        state = paper.load_state(account)
+        state["days_since_rebalance"] = 0
+        paper.save_state(account, state)
+    monkeypatch.setattr(paper, "a_universe_tickers", lambda: ["A", "B"])
+    paper.run_market(
+        "a", fetch=lambda codes, window_days=0: _a_panel(n=80),
+        attention_fetch=lambda *args, **kwargs: pytest.fail(
+            "attention query called off-cycle"
+        ),
+    )
+
+
+def test_attention_query_failure_pauses_new_accounts_but_plain_continues(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(paper, "PAPER_DIR", tmp_path)
+    for account, strategy in [
+        ("weighted", "ths_attention_weighted"),
+        ("funnel", "ths_attention_funnel"),
+    ]:
+        paper.init(account, 100000.0, strategy=strategy, market="a")
+    paper.init("plain", 100000.0, strategy="momentum", market="a",
+               params={"top_n": 1, "lookback": 10,
+                       "skip": 2, "rebalance": 5})
+    monkeypatch.setattr(paper, "a_universe_tickers", lambda: ["A", "B"])
+
+    paper.run_market(
+        "a", fetch=lambda codes, window_days=0: _a_panel(n=80),
+        attention_fetch=lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("temporary attention failure")
+        ),
+    )
+    assert paper.load_state("weighted")["pending_targets"] is None
+    assert paper.load_state("funnel")["pending_targets"] is None
+    assert paper.load_state("plain")["last_run"] is not None
+    audit = pd.read_csv(tmp_path / "ths_attention_combo_signals.csv")
+    assert set(audit["account"]) == {"weighted", "funnel"}
+    assert set(audit["status"]) == {"error"}
+
+
+def test_attention_selector_failure_isolated_per_account(monkeypatch):
+    states = {}
+    for account, strategy in [
+        ("weighted", "ths_attention_weighted"),
+        ("funnel", "ths_attention_funnel"),
+    ]:
+        state = _state()
+        state.update({"strategy": strategy, "params": {
+            "top_n": 20, "candidate_n": 100,
+            "rebalance": 2, "min_history": 60,
+        }})
+        states[account] = state
+    monkeypatch.setattr(
+        ths_attention_combo, "select_weighted",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("weighted calculation failed")
+        ),
+    )
+    _, overrides, audit = paper.prepare_attention_targets(
+        states, _a_panel(n=80),
+        lambda *args, **kwargs: pytest.fail("no supplement expected"),
+        fetch_candidates=lambda *args, **kwargs: _attention_candidates(),
+    )
+    assert overrides["weighted"] == {}
+    assert overrides["funnel"]
+    errors = [row for row in audit if row["status"] == "error"]
+    assert {row["account"] for row in errors} == {"weighted"}
+
+
+def test_attention_supplement_is_shared_partial_failure_audited_and_benchmark_pure():
+    states = {}
+    for account, strategy in [
+        ("weighted", "ths_attention_weighted"),
+        ("funnel", "ths_attention_funnel"),
+    ]:
+        state = _state()
+        state.update({"strategy": strategy, "params": {
+            "top_n": 20, "candidate_n": 100,
+            "rebalance": 2, "min_history": 60,
+        }})
+        states[account] = state
+    panel = _a_panel(n=80)
+    panel["benchmark_close"] = panel["close"][["A", "B"]].copy()
+    original_benchmark = panel["benchmark_close"].copy()
+    calls = []
+
+    def fake_panel(codes, window_days=0):
+        calls.append(tuple(codes))
+        if "BAD" in codes:
+            raise RuntimeError("bad supplemental ticker")
+        return _a_panel(tuple(codes), n=80)
+
+    result, overrides, audit = paper.prepare_attention_targets(
+        states, panel, fake_panel,
+        fetch_candidates=lambda *args, **kwargs: _attention_candidates(
+            ("A", "C", "BAD")
+        ),
+    )
+    assert calls == [("BAD", "C"), ("BAD",), ("C",)]
+    pd.testing.assert_frame_equal(result["benchmark_close"], original_benchmark)
+    assert overrides["weighted"] and overrides["funnel"]
+    assert all("BAD" not in weights for weights in overrides.values())
+    errors = [row for row in audit if row["status"] == "error"]
+    assert {row["account"] for row in errors} == {"weighted", "funnel"}
+    assert all("BAD" in row["error"] for row in errors)
+
+
+def test_attention_silent_supplement_omission_is_audited_for_both_accounts():
+    states = {}
+    for account, strategy in [
+        ("weighted", "ths_attention_weighted"),
+        ("funnel", "ths_attention_funnel"),
+    ]:
+        state = _state()
+        state.update({"strategy": strategy, "params": {
+            "top_n": 20, "candidate_n": 100,
+            "rebalance": 2, "min_history": 60,
+        }})
+        states[account] = state
+
+    _, overrides, audit = paper.prepare_attention_targets(
+        states, _a_panel(n=80),
+        lambda codes, window_days=0: _a_panel(("C",), n=80),
+        fetch_candidates=lambda *args, **kwargs: _attention_candidates(
+            ("A", "C", "BAD")
+        ),
+    )
+    assert overrides["weighted"] and overrides["funnel"]
+    errors = [row for row in audit if row["status"] == "error"]
+    assert {row["account"] for row in errors} == {"weighted", "funnel"}
+    assert all("BAD" in row["error"] for row in errors)
+
+
+def test_failed_due_attention_target_stays_due_for_next_day():
+    state = _state()
+    state["strategy"] = "ths_attention_weighted"
+    state["params"] = {
+        "top_n": 20, "candidate_n": 100,
+        "rebalance": 2, "min_history": 60,
+    }
+    state["days_since_rebalance"] = 2
+    state, _, _ = paper.step(
+        state, {"close": _close()}, target_override={}
+    )
+    assert state["pending_targets"] is None
+    assert paper.rebalance_due(state) is True
+
+
+@pytest.mark.parametrize(
+    "strategy", ["ths_attention_weighted", "ths_attention_funnel"]
+)
+def test_attention_compute_targets_requires_prefetched_override(strategy):
+    assert paper.compute_targets(
+        strategy, _a_panel(n=80), {
+            "top_n": 20, "candidate_n": 100,
+            "rebalance": 2, "min_history": 60,
+        }
+    ) == {}
+
+
+def test_append_attention_signals_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setattr(paper, "PAPER_DIR", tmp_path)
+    rows = [{
+        "date": "2026-07-15", "account": "weighted",
+        "strategy": "ths_attention_weighted", "rank": 1,
+        "ticker": "000001", "name": "甲", "attention_rise": 10.0,
+        "momentum_7d": 0.05, "float_ratio": 0.2,
+        "attention_pct": 1.0, "momentum_pct": 0.8,
+        "low_float_pct": 0.9, "score": 0.92,
+        "status": "ok", "error": "",
+    }]
+    paper.append_attention_signals(rows)
+    paper.append_attention_signals(rows)
+    assert len(pd.read_csv(tmp_path / "ths_attention_combo_signals.csv")) == 1

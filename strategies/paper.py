@@ -14,16 +14,25 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from strategies import momentum, ths_heat
+from strategies import momentum, ths_attention_combo, ths_heat
 
 PARAMS = {"top_n": 40, "lookback": 126, "skip": 21, "rebalance": 21}
 A101_PARAMS = {"top_n": 50, "rebalance": 5}
 EW_PARAMS = {"top_n": 500, "rebalance": 5}
 THS_HEAT_PARAMS = {"top_n": 20, "rebalance": 2}
 HEAT_STRATEGIES = {"ths_heat", "ths_heat_rise"}
+ATTENTION_PARAMS = {
+    "top_n": 20, "candidate_n": 100, "rebalance": 2, "min_history": 60,
+}
+ATTENTION_STRATEGIES = {
+    "ths_attention_weighted", "ths_attention_funnel",
+}
+NETWORK_STRATEGIES = HEAT_STRATEGIES | ATTENTION_STRATEGIES
 DEFAULT_PARAMS = {"momentum": PARAMS, "alpha101": A101_PARAMS,
                   "equal_weight": EW_PARAMS, "ths_heat": THS_HEAT_PARAMS,
-                  "ths_heat_rise": THS_HEAT_PARAMS}
+                  "ths_heat_rise": THS_HEAT_PARAMS,
+                  "ths_attention_weighted": ATTENTION_PARAMS,
+                  "ths_attention_funnel": ATTENTION_PARAMS}
 COST_BPS = 20.0
 UNIVERSE_SIZE = 500
 FETCH_SIZE = 800
@@ -32,6 +41,12 @@ PAPER_DIR = Path("paper")
 CURRENCIES = {"us": "$", "hk": "HK$", "a": "¥"}
 HEAT_SIGNAL_COLUMNS = [
     "date", "strategy", "rank", "ticker", "name", "factor_value",
+    "status", "error",
+]
+ATTENTION_SIGNAL_COLUMNS = [
+    "date", "account", "strategy", "rank", "ticker", "name",
+    "attention_rise", "momentum_7d", "float_ratio",
+    "attention_pct", "momentum_pct", "low_float_pct", "score",
     "status", "error",
 ]
 ERROR_SUMMARY_LIMIT = 300
@@ -137,7 +152,7 @@ def positions_value(positions: dict, prices) -> float:
 def compute_targets(strategy, panel, params, target_override=None) -> dict:
     if target_override is not None:
         return target_override
-    if strategy in HEAT_STRATEGIES:
+    if strategy in NETWORK_STRATEGIES:
         return {}
     if strategy == "alpha101":
         from strategies.alpha101_composite import targets
@@ -408,6 +423,24 @@ def _upsert_csv(path, rows, key_columns, columns):
         temporary.unlink(missing_ok=True)
 
 
+def _attention_error_row(date, account, strategy, error):
+    return {
+        "date": date, "account": account, "strategy": strategy,
+        "rank": "", "ticker": "", "name": "", "attention_rise": "",
+        "momentum_7d": "", "float_ratio": "", "attention_pct": "",
+        "momentum_pct": "", "low_float_pct": "", "score": "",
+        "status": "error", "error": sanitize_error(error),
+    }
+
+
+def append_attention_signals(rows, path=None):
+    path = path or PAPER_DIR / "ths_attention_combo_signals.csv"
+    _upsert_csv(
+        path, rows, ["date", "account", "rank", "ticker", "status"],
+        ATTENTION_SIGNAL_COLUMNS,
+    )
+
+
 def prepare_heat_targets(states, panel, fetch_panel, fetch_signal=None):
     signal_date = panel["close"].index[-1]
     date_text = signal_date.strftime("%Y-%m-%d")
@@ -475,6 +508,102 @@ def prepare_heat_targets(states, panel, fetch_panel, fetch_signal=None):
     return panel, overrides, audit
 
 
+def prepare_attention_targets(
+    states, panel, fetch_panel, fetch_candidates=None
+):
+    signal_date = panel["close"].index[-1]
+    date_text = signal_date.strftime("%Y-%m-%d")
+    due = {
+        account: state for account, state in states.items()
+        if state.get("strategy") in ATTENTION_STRATEGIES
+        and state.get("last_run") != date_text and rebalance_due(state)
+    }
+    if not due:
+        return panel, {}, []
+    loader = fetch_candidates or ths_attention_combo.fetch_candidates
+    candidate_n = max(state["params"]["candidate_n"] for state in due.values())
+    audit = []
+    try:
+        candidates = loader(signal_date, candidate_n=candidate_n)
+    except Exception as error:
+        return panel, {account: {} for account in due}, [
+            _attention_error_row(
+                date_text, account, state["strategy"], error
+            ) for account, state in due.items()
+        ]
+
+    missing = sorted(set(candidates["ticker"].astype(str))
+                     - set(panel["close"].columns))
+    quote_errors = {}
+    if missing:
+        panel, quote_errors, _ = _fetch_supplemental(
+            panel, missing, fetch_panel
+        )
+    quote_issues = dict(quote_errors)
+    latest = panel["close"].iloc[-1]
+    for ticker in missing:
+        price = pd.to_numeric(latest.get(ticker, np.nan), errors="coerce")
+        if ticker not in panel["close"].columns:
+            quote_issues.setdefault(
+                ticker, RuntimeError("supplemental response omitted ticker")
+            )
+        elif not np.isfinite(price) or price <= 0:
+            quote_issues.setdefault(
+                ticker, RuntimeError("no valid signal-date close")
+            )
+    min_history = max(state["params"]["min_history"] for state in due.values())
+    try:
+        factors = ths_attention_combo.factor_frame(
+            candidates, panel["close"], min_history=min_history
+        )
+    except Exception as error:
+        return panel, {account: {} for account in due}, [
+            _attention_error_row(
+                date_text, account, state["strategy"], error
+            ) for account, state in due.items()
+        ]
+
+    overrides = {}
+    current_prices = panel["close"].iloc[-1]
+    for account, state in due.items():
+        strategy = state["strategy"]
+        account_errors = []
+        if quote_issues:
+            account_errors.append("; ".join(
+                f"{ticker}: {quote_issues[ticker]}"
+                for ticker in sorted(quote_issues)
+            ))
+        try:
+            selector = (
+                ths_attention_combo.select_weighted
+                if strategy == "ths_attention_weighted"
+                else ths_attention_combo.select_funnel
+            )
+            selected = selector(factors, top_n=state["params"]["top_n"])
+            weights = ths_attention_combo.target_weights(
+                selected, current_prices
+            )
+            overrides[account] = weights
+            if not weights:
+                raise RuntimeError("no attention candidates have valid targets")
+            used = selected[selected["ticker"].isin(weights)]
+            audit.extend({
+                **{column: row.get(column, "")
+                   for column in ATTENTION_SIGNAL_COLUMNS},
+                "date": date_text, "account": account,
+                "status": "ok", "error": "",
+            } for row in used.to_dict("records"))
+        except Exception as error:
+            overrides[account] = {}
+            account_errors.append(str(error))
+        if account_errors:
+            audit.append(_attention_error_row(
+                date_text, account, strategy,
+                RuntimeError("; ".join(account_errors)),
+            ))
+    return panel, overrides, audit
+
+
 def _step_and_persist(account, state, panel, target_override=None):
     state, nav_row, orders = step(
         state, panel, target_override=target_override
@@ -498,7 +627,8 @@ def _step_and_persist(account, state, panel, target_override=None):
           f"挂单 {pending} 只")
 
 
-def run(account="us_momentum", fetch=None, heat_fetch=None):
+def run(account="us_momentum", fetch=None, heat_fetch=None,
+        attention_fetch=None):
     state = load_state(account)
     market = state.get("market", "us")
     panel = _market_panel(market, _held(state), fetch=fetch)
@@ -509,10 +639,16 @@ def run(account="us_momentum", fetch=None, heat_fetch=None):
             fetch_signal=heat_fetch,
         )
         append_heat_signals(audit)
+        panel, attention_overrides, attention_audit = prepare_attention_targets(
+            {account: state}, panel, fetch or fetch_a_panel,
+            fetch_candidates=attention_fetch,
+        )
+        overrides.update(attention_overrides)
+        append_attention_signals(attention_audit)
     _step_and_persist(account, state, panel, overrides.get(account))
 
 
-def run_market(market, fetch=None, heat_fetch=None):
+def run_market(market, fetch=None, heat_fetch=None, attention_fetch=None):
     """同市场账户共用基础抓数，热度策略仅在到期日预取信号。"""
     manifest = PAPER_DIR / "accounts.json"
     entries = json.loads(manifest.read_text()) if manifest.exists() else []
@@ -533,6 +669,12 @@ def run_market(market, fetch=None, heat_fetch=None):
             states, panel, fetch or fetch_a_panel, fetch_signal=heat_fetch
         )
         append_heat_signals(audit)
+        panel, attention_overrides, attention_audit = prepare_attention_targets(
+            states, panel, fetch or fetch_a_panel,
+            fetch_candidates=attention_fetch,
+        )
+        overrides.update(attention_overrides)
+        append_attention_signals(attention_audit)
     failures = []
     for account, state in states.items():
         try:
