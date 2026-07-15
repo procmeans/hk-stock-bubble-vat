@@ -801,6 +801,113 @@ def test_attention_supplement_is_hidden_from_ordinary_accounts(
     assert "C" not in seen["plain"]
 
 
+def test_attention_pending_name_stays_hidden_from_other_accounts_next_day(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(paper, "PAPER_DIR", tmp_path)
+    paper.init(
+        "weighted", 100000.0, strategy="ths_attention_weighted", market="a"
+    )
+    paper.init("plain", 100000.0, strategy="momentum", market="a",
+               params=SMALL)
+    monkeypatch.setattr(paper, "a_universe_tickers", lambda: ["A", "B"])
+    periods = {"count": 80}
+    candidate_calls = []
+
+    def fake_panel(codes, window_days=0):
+        return _a_panel(tuple(codes), n=periods["count"])
+
+    def fake_candidates(day, candidate_n=100):
+        candidate_calls.append(day)
+        return _attention_candidates(("A", "C"))
+
+    paper.run_market(
+        "a", fetch=fake_panel, attention_fetch=fake_candidates
+    )
+    assert "C" in paper.load_state("weighted")["pending_targets"]
+
+    periods["count"] = 81
+    seen = {}
+
+    def capture_panel(account, state, panel, target_override=None):
+        seen[account] = set(panel["close"].columns)
+
+    monkeypatch.setattr(paper, "_step_and_persist", capture_panel)
+    paper.run_market(
+        "a", fetch=fake_panel, attention_fetch=fake_candidates
+    )
+
+    assert len(candidate_calls) == 1
+    assert "C" in seen["weighted"]
+    assert "C" not in seen["plain"]
+    assert {"A", "B"}.issubset(seen["plain"])
+
+
+def test_attention_supplement_is_locked_to_signal_date(monkeypatch):
+    state = _state()
+    state.update({
+        "strategy": "ths_attention_weighted",
+        "params": {
+            "top_n": 20, "candidate_n": 100,
+            "rebalance": 2, "min_history": 60,
+        },
+    })
+    panel = _a_panel(n=80)
+    panel["benchmark_close"] = panel["close"].copy()
+    signal_date = panel["close"].index[-1]
+    supplement = _a_panel(("C",), n=81)
+    supplement["close"].iloc[-1, 0] = 1000.0
+    supplement["returns"] = supplement["close"].pct_change()
+    supplement["amount"] = supplement["close"] * 1000.0
+    seen = {}
+
+    def fake_candidates(day, candidate_n=100):
+        seen["query_date"] = day
+        return _attention_candidates(("C",))
+
+    real_factor_frame = ths_attention_combo.factor_frame
+
+    def capture_factor_date(candidates, close, min_history=60):
+        seen["factor_date"] = close.index[-1]
+        return real_factor_frame(
+            candidates, close, min_history=min_history
+        )
+
+    real_target_weights = ths_attention_combo.target_weights
+
+    def capture_price_date(selected, prices):
+        seen["price_date"] = prices.name
+        return real_target_weights(selected, prices)
+
+    monkeypatch.setattr(
+        ths_attention_combo, "factor_frame", capture_factor_date
+    )
+    monkeypatch.setattr(
+        ths_attention_combo, "target_weights", capture_price_date
+    )
+    result, overrides, audit = paper.prepare_attention_targets(
+        {"weighted": state}, panel,
+        lambda codes, window_days=0: supplement,
+        fetch_candidates=fake_candidates,
+    )
+
+    assert seen == {
+        "query_date": signal_date,
+        "factor_date": signal_date,
+        "price_date": signal_date,
+    }
+    assert all(
+        frame.index[-1] == signal_date
+        for frame in result.values() if isinstance(frame, pd.DataFrame)
+    )
+    ok = [row for row in audit if row["status"] == "ok"]
+    assert {row["date"] for row in ok} == {
+        signal_date.strftime("%Y-%m-%d")
+    }
+    assert ok[0]["momentum_7d"] == pytest.approx(0.0)
+    assert overrides["weighted"] == {"C": 1.0}
+
+
 def test_non_due_attention_accounts_do_not_query(tmp_path, monkeypatch):
     monkeypatch.setattr(paper, "PAPER_DIR", tmp_path)
     for account, strategy in [

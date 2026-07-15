@@ -330,6 +330,21 @@ def _held(state: dict) -> set:
     return set(state["positions"]) | set(state["pending_targets"] or {})
 
 
+def _account_panel(panel, state):
+    benchmark = panel.get("benchmark_close")
+    benchmark_tickers = (
+        set(benchmark.columns)
+        if isinstance(benchmark, pd.DataFrame) else set()
+    )
+    keep = benchmark_tickers | _held(state)
+    return {
+        key: value[[column for column in value.columns if column in keep]]
+        if isinstance(value, pd.DataFrame) and key != "benchmark_close"
+        else value
+        for key, value in panel.items()
+    }
+
+
 def _merge_panel(base, extra):
     merged = dict(base)
     for key, value in extra.items():
@@ -539,8 +554,14 @@ def prepare_attention_targets(
         panel, quote_errors, _ = _fetch_supplemental(
             panel, missing, fetch_panel
         )
+    panel = {
+        key: value.loc[value.index <= signal_date]
+        if isinstance(value, pd.DataFrame) else value
+        for key, value in panel.items()
+    }
+    close_history = panel["close"]
     quote_issues = dict(quote_errors)
-    latest = panel["close"].iloc[-1]
+    latest = close_history.loc[signal_date]
     for ticker in missing:
         price = pd.to_numeric(latest.get(ticker, np.nan), errors="coerce")
         if ticker not in panel["close"].columns:
@@ -554,7 +575,7 @@ def prepare_attention_targets(
     min_history = max(state["params"]["min_history"] for state in due.values())
     try:
         factors = ths_attention_combo.factor_frame(
-            candidates, panel["close"], min_history=min_history
+            candidates, close_history, min_history=min_history
         )
     except Exception as error:
         return panel, {account: {} for account in due}, [
@@ -564,7 +585,7 @@ def prepare_attention_targets(
         ]
 
     overrides = {}
-    current_prices = panel["close"].iloc[-1]
+    current_prices = close_history.loc[signal_date]
     for account, state in due.items():
         strategy = state["strategy"]
         account_errors = []
@@ -691,11 +712,12 @@ def run_market(market, fetch=None, heat_fetch=None, attention_fetch=None):
     failures = []
     for account, state in states.items():
         try:
-            account_panel = (
-                attention_panel
-                if state.get("strategy") in ATTENTION_STRATEGIES
-                else attention_base_panel
-            )
+            if state.get("strategy") in ATTENTION_STRATEGIES:
+                account_panel = attention_panel
+            elif market == "a":
+                account_panel = _account_panel(attention_base_panel, state)
+            else:
+                account_panel = attention_base_panel
             _step_and_persist(
                 account, state, account_panel, overrides.get(account)
             )
