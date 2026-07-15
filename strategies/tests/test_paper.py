@@ -774,6 +774,33 @@ def test_run_market_shares_one_attention_query_between_two_accounts(
     assert paper.load_state("funnel")["pending_targets"]
 
 
+def test_attention_supplement_is_hidden_from_ordinary_accounts(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(paper, "PAPER_DIR", tmp_path)
+    paper.init(
+        "weighted", 100000.0, strategy="ths_attention_weighted", market="a"
+    )
+    paper.init("plain", 100000.0, strategy="momentum", market="a",
+               params=SMALL)
+    monkeypatch.setattr(paper, "a_universe_tickers", lambda: ["A", "B"])
+    seen = {}
+
+    def capture_panel(account, state, panel, target_override=None):
+        seen[account] = set(panel["close"].columns)
+
+    monkeypatch.setattr(paper, "_step_and_persist", capture_panel)
+    paper.run_market(
+        "a", fetch=lambda codes, window_days=0: _a_panel(tuple(codes), n=80),
+        attention_fetch=lambda *args, **kwargs: _attention_candidates(
+            ("A", "C")
+        ),
+    )
+
+    assert "C" in seen["weighted"]
+    assert "C" not in seen["plain"]
+
+
 def test_non_due_attention_accounts_do_not_query(tmp_path, monkeypatch):
     monkeypatch.setattr(paper, "PAPER_DIR", tmp_path)
     for account, strategy in [

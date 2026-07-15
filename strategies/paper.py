@@ -639,12 +639,20 @@ def run(account="us_momentum", fetch=None, heat_fetch=None,
             fetch_signal=heat_fetch,
         )
         append_heat_signals(audit)
-        panel, attention_overrides, attention_audit = prepare_attention_targets(
+        attention_base_panel = panel
+        (
+            attention_panel, attention_overrides, attention_audit
+        ) = prepare_attention_targets(
             {account: state}, panel, fetch or fetch_a_panel,
             fetch_candidates=attention_fetch,
         )
         overrides.update(attention_overrides)
         append_attention_signals(attention_audit)
+        panel = (
+            attention_panel
+            if state.get("strategy") in ATTENTION_STRATEGIES
+            else attention_base_panel
+        )
     _step_and_persist(account, state, panel, overrides.get(account))
 
 
@@ -663,13 +671,18 @@ def run_market(market, fetch=None, heat_fetch=None, attention_fetch=None):
     for state in states.values():
         held |= _held(state)
     panel = _market_panel(market, held, fetch=fetch)
+    attention_base_panel = panel
+    attention_panel = panel
     overrides, audit = {}, []
     if market == "a":
         panel, overrides, audit = prepare_heat_targets(
             states, panel, fetch or fetch_a_panel, fetch_signal=heat_fetch
         )
         append_heat_signals(audit)
-        panel, attention_overrides, attention_audit = prepare_attention_targets(
+        attention_base_panel = panel
+        (
+            attention_panel, attention_overrides, attention_audit
+        ) = prepare_attention_targets(
             states, panel, fetch or fetch_a_panel,
             fetch_candidates=attention_fetch,
         )
@@ -678,7 +691,14 @@ def run_market(market, fetch=None, heat_fetch=None, attention_fetch=None):
     failures = []
     for account, state in states.items():
         try:
-            _step_and_persist(account, state, panel, overrides.get(account))
+            account_panel = (
+                attention_panel
+                if state.get("strategy") in ATTENTION_STRATEGIES
+                else attention_base_panel
+            )
+            _step_and_persist(
+                account, state, account_panel, overrides.get(account)
+            )
         except Exception as error:
             failures.append((account, error))
     if failures:
