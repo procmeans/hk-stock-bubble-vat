@@ -23,5 +23,15 @@
   "account": "a_ths_heat_rise",
   "title": "A股 同花顺热度上升",
   "currency": "¥"
+ },
+ {
+  "account": "a_ths_attention_weighted",
+  "title": "A股 注意力加权组合",
+  "currency": "¥"
+ },
+ {
+  "account": "a_ths_attention_funnel",
+  "title": "A股 注意力逐层筛选",
+  "currency": "¥"
  }
 ]

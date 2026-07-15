@@ -1,0 +1,13 @@
+{
+ "account": "a_ths_attention_weighted",
+ "capital": 100000.0,
+ "cash": 100000.0,
+ "positions": {},
+ "pending_targets": null,
+ "days_since_rebalance": null,
+ "bench_nav": 100000.0,
+ "last_run": null,
+ "strategy": "ths_attention_weighted",
+ "market": "a",
+ "params": {"top_n": 20, "candidate_n": 100, "rebalance": 2, "min_history": 60}
+}

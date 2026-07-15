@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>模拟盘 · 五策略</title>
+<title>模拟盘 · 七策略</title>
 <style>
   :root{
     --surface:#0a0e1a; --panel:#10182b; --ink:#e8eef7; --ink-2:#8da2c0;
@@ -97,6 +97,10 @@ const DESC = {
     '注:热度反映市场关注而非已验证正向 alpha,高关注可能伴随过度反应',
   a_ths_heat_rise: '同花顺个股热度排名环比增长率 top 20 等权 · 每 2 交易日调仓 · ' +
     '虚拟资金 ¥100,000 · 单边 20bp · 注:信号短期且换手可能较高',
+  a_ths_attention_weighted: '注意力上升50% + 7日动量30% + 低流通比例20% · top 20等权 · ' +
+    '每2交易日调仓 · 虚拟资金 ¥100,000 · 注:组合权重未经历史优化,仅做前向检验',
+  a_ths_attention_funnel: '注意力上升前100 → 7日动量为正 → 低流通比例50% → top 20等权 · ' +
+    '每2交易日调仓 · 虚拟资金 ¥100,000 · 注:硬门槛可能导致持仓不足20只',
 };
 
 function parseCSV(text) {

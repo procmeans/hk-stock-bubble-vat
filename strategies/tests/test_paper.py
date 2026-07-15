@@ -982,3 +982,46 @@ def test_append_attention_signals_is_idempotent(tmp_path, monkeypatch):
     paper.append_attention_signals(rows)
     paper.append_attention_signals(rows)
     assert len(pd.read_csv(tmp_path / "ths_attention_combo_signals.csv")) == 1
+
+
+def test_repository_has_two_attention_combo_accounts_and_seven_strategy_ui():
+    root = paper.Path(__file__).resolve().parents[2]
+    entries = json.loads((root / "paper" / "accounts.json").read_text())
+    assert len(entries) == 7
+    by_account = {entry["account"]: entry for entry in entries}
+    expected = {
+        "a_ths_attention_weighted": (
+            "A股 注意力加权组合", "ths_attention_weighted"
+        ),
+        "a_ths_attention_funnel": (
+            "A股 注意力逐层筛选", "ths_attention_funnel"
+        ),
+    }
+    for account, (title, strategy) in expected.items():
+        assert by_account[account] == {
+            "account": account, "title": title, "currency": "¥",
+        }
+        state = json.loads((root / "paper" / account / "state.json").read_text())
+        assert state["capital"] == state["cash"] == 100000.0
+        assert state["strategy"] == strategy and state["market"] == "a"
+        assert state["params"] == {
+            "top_n": 20, "candidate_n": 100,
+            "rebalance": 2, "min_history": 60,
+        }
+        assert (root / "paper" / account / "nav.csv").read_text() == (
+            "date,nav,cash,positions_value,bench_nav\n"
+        )
+        assert (root / "paper" / account / "orders.csv").read_text() == (
+            "date,ticker,side,shares,price,value,cost\n"
+        )
+    audit = pd.read_csv(root / "paper" / "ths_attention_combo_signals.csv")
+    assert audit.columns.tolist() == paper.ATTENTION_SIGNAL_COLUMNS
+    html = (root / "paper.html").read_text()
+    index = (root / "index.html").read_text()
+    assert "模拟盘 · 七策略" in html and "模拟盘 · 七策略 →" in index
+    assert "a_ths_attention_weighted" in html
+    assert "a_ths_attention_funnel" in html
+    workflow = (root / ".github/workflows/paper-a.yml").read_text()
+    assert "THS_HTTP_REFRESH_TOKEN" in workflow
+    assert "run-market --market a" in workflow
+    assert "git add paper/" in workflow
