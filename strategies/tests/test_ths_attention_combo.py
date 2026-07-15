@@ -153,3 +153,30 @@ def test_target_weights_rechecks_t_close_and_renormalizes():
     selected = pd.DataFrame({"ticker": ["A", "B", "C"]})
     prices = pd.Series({"A": 10.0, "B": np.nan, "C": 30.0})
     assert combo.target_weights(selected, prices) == {"A": 0.5, "C": 0.5}
+
+
+@pytest.mark.parametrize(("selector", "top_n", "expected"), [
+    pytest.param(combo.select_weighted, 99, 20, id="weighted-cap"),
+    pytest.param(combo.select_funnel, 99, 20, id="funnel-cap"),
+    pytest.param(combo.select_weighted, -1, 0, id="weighted-negative"),
+    pytest.param(combo.select_funnel, -1, 0, id="funnel-negative"),
+])
+def test_selectors_cap_at_twenty_and_treat_negative_top_n_as_zero(
+    selector, top_n, expected
+):
+    size = 42
+    order = np.arange(1, size + 1, dtype=float)
+    factors = pd.DataFrame({
+        "date": ["2026-07-15"] * size,
+        "ticker": [f"{index:06d}" for index in range(size)],
+        "name": [f"stock-{index}" for index in range(size)],
+        "attention_rise": order,
+        "float_a": order,
+        "total_shares": [100.0] * size,
+        "momentum_7d": order / 100.0,
+        "float_ratio": order / 100.0,
+        "attention_pct": order / size,
+        "momentum_pct": order / size,
+        "low_float_pct": order[::-1] / size,
+    })
+    assert len(selector(factors, top_n=top_n)) == expected

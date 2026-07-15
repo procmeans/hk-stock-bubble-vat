@@ -123,12 +123,13 @@ SELECTED_COLUMNS = ["strategy", "rank", *FACTOR_COLUMNS, "score"]
 
 
 def _ranked(frame, strategy: str, top_n: int, score) -> pd.DataFrame:
+    limit = min(max(int(top_n), 0), 20)
     selected = frame.copy()
     selected["score"] = score.reindex(selected.index)
     selected = selected.sort_values(
         ["score", "attention_rise", "ticker"],
         ascending=[False, False, True],
-    ).head(int(top_n)).reset_index(drop=True)
+    ).head(limit).reset_index(drop=True)
     selected.insert(0, "rank", np.arange(1, len(selected) + 1))
     selected.insert(0, "strategy", strategy)
     return selected[SELECTED_COLUMNS]
