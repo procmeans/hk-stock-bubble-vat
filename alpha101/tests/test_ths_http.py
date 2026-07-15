@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from alpha101 import ths_http
 
@@ -29,3 +30,17 @@ def test_smart_stock_picking_posts_query_and_flattens(monkeypatch):
     assert isinstance(result, pd.DataFrame)
     assert result.loc[0, "股票代码"] == "000001.SZ"
     assert result.loc[0, "个股热度[20260715]"] == 123.5
+
+
+def test_api_error_without_message_never_stringifies_secret_payload():
+    secret = "refresh-secret-that-must-not-escape"
+    payload = {
+        "errorcode": 401,
+        "data": {"refresh_token": secret, "access_token": "access-secret"},
+    }
+
+    with pytest.raises(RuntimeError) as caught:
+        ths_http.raise_for_api_error(payload)
+
+    assert str(caught.value) == "iFinD HTTP API error 401"
+    assert secret not in str(caught.value)

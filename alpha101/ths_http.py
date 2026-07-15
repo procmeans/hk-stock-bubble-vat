@@ -127,8 +127,10 @@ def join_if_sequence(value):
 def raise_for_api_error(payload: dict) -> None:
     errorcode = payload.get("errorcode", payload.get("errcode", 0))
     if errorcode not in (0, "0", None):
-        errmsg = payload.get("errmsg") or payload.get("message") or str(payload)
-        raise RuntimeError(errmsg)
+        message = payload.get("errmsg") or payload.get("message")
+        if not isinstance(message, str) or not message.strip():
+            message = f"iFinD HTTP API error {errorcode}"
+        raise RuntimeError(message)
 
 
 def tables_to_dataframe(payload: dict) -> pd.DataFrame:
