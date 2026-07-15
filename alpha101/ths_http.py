@@ -100,6 +100,24 @@ def history_quotation(
     return tables_to_dataframe(data)
 
 
+def smart_stock_picking(
+    searchstring: str,
+    searchtype: str = "stock",
+    access_token: Optional[str] = None,
+    refresh_token: Optional[str] = None,
+    timeout: int = 30,
+) -> pd.DataFrame:
+    """Run an iFinD semantic stock query and return a flat DataFrame."""
+    data = post(
+        "smart_stock_picking",
+        {"searchstring": searchstring, "searchtype": searchtype},
+        access_token=access_token,
+        refresh_token=refresh_token,
+        timeout=timeout,
+    )
+    return tables_to_dataframe(data)
+
+
 def join_if_sequence(value):
     if isinstance(value, (list, tuple)):
         return ",".join(value)
