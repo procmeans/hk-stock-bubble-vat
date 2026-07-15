@@ -328,3 +328,23 @@ def test_append_heat_signals_is_idempotent(tmp_path, monkeypatch):
     paper.append_heat_signals(rows)
     paper.append_heat_signals(rows)
     assert len(pd.read_csv(tmp_path / "ths_heat_signals.csv")) == 2
+
+
+def test_repository_manifest_has_two_ths_heat_accounts():
+    root = paper.Path(__file__).resolve().parents[2]
+    entries = json.loads((root / "paper" / "accounts.json").read_text())
+    by_account = {entry["account"]: entry for entry in entries}
+    assert by_account["a_ths_heat"] == {
+        "account": "a_ths_heat", "title": "A股 同花顺热度", "currency": "¥"
+    }
+    assert by_account["a_ths_heat_rise"] == {
+        "account": "a_ths_heat_rise",
+        "title": "A股 同花顺热度上升", "currency": "¥",
+    }
+    for account, strategy in [
+        ("a_ths_heat", "ths_heat"),
+        ("a_ths_heat_rise", "ths_heat_rise"),
+    ]:
+        state = json.loads((root / "paper" / account / "state.json").read_text())
+        assert state["strategy"] == strategy and state["market"] == "a"
+        assert state["params"] == {"top_n": 20, "rebalance": 2}

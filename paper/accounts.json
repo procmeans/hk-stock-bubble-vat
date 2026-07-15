@@ -13,5 +13,15 @@
   "account": "a_equal_weight",
   "title": "A股 流动性500等权",
   "currency": "¥"
+ },
+ {
+  "account": "a_ths_heat",
+  "title": "A股 同花顺热度",
+  "currency": "¥"
+ },
+ {
+  "account": "a_ths_heat_rise",
+  "title": "A股 同花顺热度上升",
+  "currency": "¥"
  }
 ]

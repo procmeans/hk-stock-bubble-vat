@@ -37,6 +37,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add paper/
-          git diff --cached --quiet || git commit -m "paper: a_alpha101 daily step $(date -u +%F)"
+          git diff --cached --quiet || git commit -m "paper: A-share daily step $(date -u +%F)"
           git pull --rebase
           git push
