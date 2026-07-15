@@ -16,8 +16,11 @@ from strategies import momentum
 PARAMS = {"top_n": 40, "lookback": 126, "skip": 21, "rebalance": 21}
 A101_PARAMS = {"top_n": 50, "rebalance": 5}
 EW_PARAMS = {"top_n": 500, "rebalance": 5}
+THS_HEAT_PARAMS = {"top_n": 20, "rebalance": 2}
+HEAT_STRATEGIES = {"ths_heat", "ths_heat_rise"}
 DEFAULT_PARAMS = {"momentum": PARAMS, "alpha101": A101_PARAMS,
-                  "equal_weight": EW_PARAMS}
+                  "equal_weight": EW_PARAMS, "ths_heat": THS_HEAT_PARAMS,
+                  "ths_heat_rise": THS_HEAT_PARAMS}
 COST_BPS = 20.0
 UNIVERSE_SIZE = 500
 FETCH_SIZE = 800
@@ -86,7 +89,11 @@ def positions_value(positions: dict, prices) -> float:
     ))
 
 
-def compute_targets(strategy: str, panel: dict, params: dict) -> dict:
+def compute_targets(strategy, panel, params, target_override=None) -> dict:
+    if target_override is not None:
+        return target_override
+    if strategy in HEAT_STRATEGIES:
+        return {}
     if strategy == "alpha101":
         from strategies.alpha101_composite import targets
         return targets(panel, **params)
@@ -96,7 +103,13 @@ def compute_targets(strategy: str, panel: dict, params: dict) -> dict:
     return target_weights(panel["close"], **params)
 
 
-def step(state: dict, panel: dict, params=None, cost_bps=COST_BPS):
+def rebalance_due(state: dict, params=None) -> bool:
+    params = params or state.get("params") or PARAMS
+    days = state.get("days_since_rebalance")
+    return days is None or days + 1 >= params["rebalance"]
+
+
+def step(state, panel, params=None, cost_bps=COST_BPS, target_override=None):
     """处理 panel(至少含 close)的最新一天;返回 (state, nav_row|None, orders)。幂等。"""
     close = panel["close"]
     params = params or state.get("params") or PARAMS
@@ -136,7 +149,8 @@ def step(state: dict, panel: dict, params=None, cost_bps=COST_BPS):
 
     value = positions_value(state["positions"], prices)
     nav = state["cash"] + value
-    daily = close.ffill().pct_change().iloc[-1]
+    benchmark_close = panel.get("benchmark_close", close)
+    daily = benchmark_close.ffill().pct_change().iloc[-1]
     bench_ret = float(np.nanmean(daily)) if not daily.isna().all() else 0.0
     state["bench_nav"] = float(state["bench_nav"] * (1.0 + bench_ret))
     nav_row = {
@@ -151,7 +165,10 @@ def step(state: dict, panel: dict, params=None, cost_bps=COST_BPS):
         state["days_since_rebalance"] += 1
         due = state["days_since_rebalance"] >= params["rebalance"]
     if due:
-        new_targets = compute_targets(state.get("strategy", "momentum"), panel, params)
+        new_targets = compute_targets(
+            state.get("strategy", "momentum"), panel, params,
+            target_override=target_override,
+        )
         if new_targets:
             state["pending_targets"] = new_targets
             state["days_since_rebalance"] = 0

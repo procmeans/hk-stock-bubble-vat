@@ -173,3 +173,56 @@ def test_run_a_market_uses_amount_pool(tmp_path, monkeypatch):
     paper.run("acct2", fetch=lambda codes, window_days=0: panel)
     assert paper.load_state("acct2")["last_run"] == \
         close.index[-1].strftime("%Y-%m-%d")
+
+
+@pytest.mark.parametrize("strategy", ["ths_heat", "ths_heat_rise"])
+def test_step_uses_prefetched_heat_targets(strategy):
+    state = _state()
+    state["strategy"] = strategy
+    state["params"] = {"top_n": 20, "rebalance": 2}
+    state, _, _ = paper.step(
+        state, {"close": _close()}, target_override={"B": 1.0}
+    )
+    assert state["pending_targets"] == {"B": 1.0}
+
+
+def test_heat_rebalance_two_holds_for_two_closes():
+    close = _close(15)
+    state = _state()
+    state["strategy"] = "ths_heat"
+    state["params"] = {"top_n": 1, "rebalance": 2}
+    state, _, _ = paper.step(
+        state, {"close": close.iloc[:12]}, target_override={"A": 1.0}
+    )
+    state, _, _ = paper.step(state, {"close": close.iloc[:13]})
+    assert state["pending_targets"] is None and "A" in state["positions"]
+    state, _, _ = paper.step(
+        state, {"close": close.iloc[:14]}, target_override={"B": 1.0}
+    )
+    assert state["pending_targets"] == {"B": 1.0}
+    state, _, _ = paper.step(state, {"close": close.iloc[:15]})
+    assert "B" in state["positions"] and "A" not in state["positions"]
+
+
+def test_benchmark_close_excludes_supplemental_hot_stock():
+    idx = pd.bdate_range("2026-07-14", periods=2)
+    close = pd.DataFrame({"A": [10.0, 10.0], "HOT": [10.0, 20.0]}, index=idx)
+    state = _state()
+    state["strategy"] = "ths_heat"
+    state["params"] = {"top_n": 1, "rebalance": 2}
+    state, nav_row, _ = paper.step(
+        state,
+        {"close": close, "benchmark_close": close[["A"]]},
+        target_override={},
+    )
+    assert nav_row["bench_nav"] == 100000.0
+
+
+def test_failed_due_heat_signal_stays_due_for_next_day():
+    state = _state()
+    state["strategy"] = "ths_heat"
+    state["params"] = {"top_n": 20, "rebalance": 2}
+    state["days_since_rebalance"] = 2
+    state, _, _ = paper.step(state, {"close": _close()}, target_override={})
+    assert state["pending_targets"] is None
+    assert paper.rebalance_due(state) is True
