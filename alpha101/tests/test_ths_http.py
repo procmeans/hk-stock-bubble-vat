@@ -44,3 +44,17 @@ def test_api_error_without_message_never_stringifies_secret_payload():
 
     assert str(caught.value) == "iFinD HTTP API error 401"
     assert secret not in str(caught.value)
+
+
+def test_api_error_never_stringifies_nested_credential_bearing_error_code():
+    secret = "nested-refresh-secret"
+    payload = {
+        "errorcode": {"code": 401, "refresh_token": secret},
+        "data": {"reason": "malformed response"},
+    }
+
+    with pytest.raises(RuntimeError) as caught:
+        ths_http.raise_for_api_error(payload)
+
+    assert str(caught.value) == "iFinD HTTP API error unknown"
+    assert secret not in str(caught.value)

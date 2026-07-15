@@ -40,6 +40,10 @@ _QUOTED_CREDENTIAL_RE = re.compile(
     rf"([\"']?{_CREDENTIAL_FIELD}[\"']?\s*[:=]\s*)([\"'])(.*?)\2",
     flags=re.IGNORECASE | re.DOTALL,
 )
+_UNQUOTED_AUTHORIZATION_RE = re.compile(
+    r"(\bauthorization\b\s*[:=]\s*)[^,;}\]\r\n]+",
+    flags=re.IGNORECASE,
+)
 _PLAIN_CREDENTIAL_RE = re.compile(
     rf"(\b{_CREDENTIAL_FIELD}\b\s*[:=]\s*)(?:Bearer\s+)?[^\s,;}}\]]+",
     flags=re.IGNORECASE,
@@ -323,21 +327,25 @@ def _merge_panel(base, extra):
 def _fetch_supplemental(panel, tickers, fetch_panel):
     tickers = sorted(set(tickers))
     if not tickers:
-        return panel, {}
+        return panel, {}, set()
     try:
         extra = fetch_panel(tickers, window_days=WINDOW_DAYS)
-        return _merge_panel(panel, extra), {}
+        return _merge_panel(panel, extra), {}, set(tickers)
     except Exception as error:
         if len(tickers) == 1:
-            return panel, {tickers[0]: error}
+            return panel, {tickers[0]: error}, set()
         middle = len(tickers) // 2
-        panel, left_errors = _fetch_supplemental(
+        panel, left_errors, left_successes = _fetch_supplemental(
             panel, tickers[:middle], fetch_panel
         )
-        panel, right_errors = _fetch_supplemental(
+        panel, right_errors, right_successes = _fetch_supplemental(
             panel, tickers[middle:], fetch_panel
         )
-        return panel, {**left_errors, **right_errors}
+        return (
+            panel,
+            {**left_errors, **right_errors},
+            left_successes | right_successes,
+        )
 
 
 def sanitize_error(error, limit=ERROR_SUMMARY_LIMIT):
@@ -346,6 +354,7 @@ def sanitize_error(error, limit=ERROR_SUMMARY_LIMIT):
     if configured_token:
         text = text.replace(configured_token, "[REDACTED]")
     text = _QUOTED_CREDENTIAL_RE.sub(r"\1[REDACTED]", text)
+    text = _UNQUOTED_AUTHORIZATION_RE.sub(r"\1[REDACTED]", text)
     text = _PLAIN_CREDENTIAL_RE.sub(r"\1[REDACTED]", text)
     text = _BEARER_RE.sub("Bearer [REDACTED]", text)
     text = _TOKEN_LIKE_RE.sub("[REDACTED]", text)
@@ -419,14 +428,17 @@ def prepare_heat_targets(states, panel, fetch_panel, fetch_signal=None):
         except Exception as error:
             audit.append(_error_row(date_text, strategy, error))
     quote_errors = {}
+    attempted_successfully = set()
     for strategy in sorted(signals):
         missing = sorted({
             ticker for ticker in signals[strategy]["ticker"].astype(str)
             if ticker not in panel["close"].columns
+            and ticker not in attempted_successfully
         })
-        panel, quote_errors[strategy] = _fetch_supplemental(
+        panel, quote_errors[strategy], successful = _fetch_supplemental(
             panel, missing, fetch_panel
         )
+        attempted_successfully |= successful
     prices = panel["close"].iloc[-1]
     overrides = {}
     for account, state in due.items():
@@ -526,11 +538,14 @@ def run_market(market, fetch=None, heat_fetch=None):
         except Exception as error:
             failures.append((account, error))
     if failures:
+        accounts = ", ".join(account for account, _ in failures)
         summary = "; ".join(
             f"{account}: {sanitize_error(error)}"
             for account, error in failures
         )
-        raise RuntimeError(f"paper account failures: {summary}")
+        raise RuntimeError(sanitize_error(
+            f"paper account failures ({accounts}): {summary}"
+        ))
 
 
 def status(account: str = "us_momentum") -> None:

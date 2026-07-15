@@ -1,6 +1,8 @@
 """Thin iFinD HTTP API client used by the Alpha101 tools."""
 
+import math
 import os
+import re
 from typing import Optional
 
 import pandas as pd
@@ -8,6 +10,9 @@ import requests
 
 BASE_URL = "https://quantapi.51ifind.com/api/v1"
 REFRESH_TOKEN_ENV = "THS_HTTP_REFRESH_TOKEN"
+_NUMERIC_ERROR_CODE_RE = re.compile(
+    r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
+)
 
 
 def get_access_token(refresh_token: Optional[str] = None, timeout: int = 15) -> str:
@@ -124,12 +129,24 @@ def join_if_sequence(value):
     return value
 
 
+def _safe_error_code(value) -> str:
+    if isinstance(value, bool):
+        return "unknown"
+    if isinstance(value, (int, float)):
+        return str(value) if math.isfinite(value) else "unknown"
+    if isinstance(value, str):
+        value = value.strip()
+        if len(value) <= 32 and _NUMERIC_ERROR_CODE_RE.fullmatch(value):
+            return value
+    return "unknown"
+
+
 def raise_for_api_error(payload: dict) -> None:
     errorcode = payload.get("errorcode", payload.get("errcode", 0))
     if errorcode not in (0, "0", None):
         message = payload.get("errmsg") or payload.get("message")
         if not isinstance(message, str) or not message.strip():
-            message = f"iFinD HTTP API error {errorcode}"
+            message = f"iFinD HTTP API error {_safe_error_code(errorcode)}"
         raise RuntimeError(message)
 
 

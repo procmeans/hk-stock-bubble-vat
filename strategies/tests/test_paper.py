@@ -408,6 +408,48 @@ def test_supplemental_quote_split_keeps_valid_pick_and_audits_missing():
     assert any("BAD" in row["error"] for row in errors)
 
 
+def test_successful_silent_omission_is_not_refetched_by_later_strategy():
+    states = {}
+    for account, strategy in [
+        ("heat", "ths_heat"), ("rise", "ths_heat_rise")
+    ]:
+        state = _state()
+        state.update({
+            "strategy": strategy,
+            "params": {"top_n": 20, "rebalance": 2},
+        })
+        states[account] = state
+
+    def fake_signal(day, strategy, top_n=20):
+        unique = "HEAT_OK" if strategy == "ths_heat" else "RISE_OK"
+        return pd.concat([
+            _signal(strategy, unique, 9.0),
+            _signal(strategy, "SHARED", 8.0),
+        ], ignore_index=True)
+
+    calls = []
+
+    def fake_panel(codes, window_days=0):
+        calls.append(tuple(codes))
+        returned = [ticker for ticker in codes if ticker != "SHARED"]
+        return _a_panel(tuple(returned))
+
+    _, overrides, audit = paper.prepare_heat_targets(
+        states, _a_panel(), fake_panel, fetch_signal=fake_signal
+    )
+
+    assert calls == [("HEAT_OK", "SHARED"), ("RISE_OK",)]
+    assert overrides == {
+        "heat": {"HEAT_OK": 1.0},
+        "rise": {"RISE_OK": 1.0},
+    }
+    errors = [row for row in audit if row["status"] == "error"]
+    assert {row["strategy"] for row in errors} == {
+        "ths_heat", "ths_heat_rise"
+    }
+    assert all("SHARED" in row["error"] for row in errors)
+
+
 def test_heat_query_failure_isolated_per_account(tmp_path, monkeypatch):
     monkeypatch.setattr(paper, "PAPER_DIR", tmp_path)
     paper.init("heat", 100000.0, strategy="ths_heat", market="a")
@@ -561,6 +603,22 @@ def test_error_audit_redacts_credentials_and_token_like_strings(
         assert secret not in persisted
 
 
+def test_error_audit_redacts_complete_unquoted_basic_authorization(tmp_path):
+    secret = "shortsecret"
+    row = paper._error_row(
+        "2026-07-15", "ths_heat",
+        RuntimeError(f"authorization: Basic {secret}; quote failed"),
+    )
+
+    paper.append_heat_signals([row], path=tmp_path / "ths_heat_signals.csv")
+    persisted = (tmp_path / "ths_heat_signals.csv").read_text()
+
+    assert "authorization: [REDACTED]" in row["error"]
+    assert "Basic" not in row["error"]
+    assert secret not in row["error"]
+    assert secret not in persisted
+
+
 def test_run_market_aggregate_redacts_credentials(tmp_path, monkeypatch):
     monkeypatch.setattr(paper, "PAPER_DIR", tmp_path)
     monkeypatch.setenv("THS_HTTP_REFRESH_TOKEN", "configured-aggregate-secret")
@@ -584,6 +642,29 @@ def test_run_market_aggregate_redacts_credentials(tmp_path, monkeypatch):
     assert "acct" in summary and "[REDACTED]" in summary
     assert "aggregate-bearer-secret" not in summary
     assert "configured-aggregate-secret" not in summary
+
+
+def test_run_market_bounds_complete_multi_account_failure_summary(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(paper, "PAPER_DIR", tmp_path)
+    for account in ["first", "second"]:
+        paper.init(
+            account, 100000.0, strategy="momentum", market="a", params=SMALL
+        )
+    monkeypatch.setattr(paper, "a_universe_tickers", lambda: ["A", "B"])
+
+    def fail_with_long_message(account, *args, **kwargs):
+        raise RuntimeError(f"{account} " + "failure detail " * 100)
+
+    monkeypatch.setattr(paper, "_step_and_persist", fail_with_long_message)
+
+    with pytest.raises(RuntimeError) as caught:
+        paper.run_market(
+            "a", fetch=lambda codes, window_days=0: _a_panel()
+        )
+
+    assert len(str(caught.value)) <= paper.ERROR_SUMMARY_LIMIT
 
 
 def test_repository_manifest_has_two_ths_heat_accounts():
