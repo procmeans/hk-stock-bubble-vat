@@ -619,6 +619,28 @@ def test_error_audit_redacts_complete_unquoted_basic_authorization(tmp_path):
     assert secret not in persisted
 
 
+@pytest.mark.parametrize(("message", "secret"), [
+    ("{'authorization': Basic quoted-key-short}", "quoted-key-short"),
+    ('{"authorization": Token quoted-key-token}', "quoted-key-token"),
+    ("'authorization'=ApiKey quoted-key-api", "quoted-key-api"),
+    ("authorization: Basic bare-key-short; quote failed", "bare-key-short"),
+    ("authorization=Token bare-key-token, quote failed", "bare-key-token"),
+    ("authorization:ApiKey bare-key-api} quote failed", "bare-key-api"),
+])
+def test_error_sanitizer_redacts_quoted_and_bare_authorization_keys(
+    tmp_path, message, secret
+):
+    summary = paper.sanitize_error(RuntimeError(message))
+    row = paper._error_row("2026-07-15", "ths_heat", RuntimeError(message))
+    paper.append_heat_signals([row], path=tmp_path / "ths_heat_signals.csv")
+    persisted = (tmp_path / "ths_heat_signals.csv").read_text()
+
+    assert secret not in summary
+    assert secret not in persisted
+    assert summary.count("[REDACTED]") == 1
+    assert "[REDACTED]]" not in summary
+
+
 def test_run_market_aggregate_redacts_credentials(tmp_path, monkeypatch):
     monkeypatch.setattr(paper, "PAPER_DIR", tmp_path)
     monkeypatch.setenv("THS_HTTP_REFRESH_TOKEN", "configured-aggregate-secret")
@@ -627,7 +649,7 @@ def test_run_market_aggregate_redacts_credentials(tmp_path, monkeypatch):
 
     def fail_with_secret(*args, **kwargs):
         raise RuntimeError(
-            "authorization: Bearer aggregate-bearer-secret "
+            '{"authorization": Token aggregate-auth-secret}; '
             "refresh_token=configured-aggregate-secret"
         )
 
@@ -640,7 +662,7 @@ def test_run_market_aggregate_redacts_credentials(tmp_path, monkeypatch):
 
     summary = str(caught.value)
     assert "acct" in summary and "[REDACTED]" in summary
-    assert "aggregate-bearer-secret" not in summary
+    assert "aggregate-auth-secret" not in summary
     assert "configured-aggregate-secret" not in summary
 
 

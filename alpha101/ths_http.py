@@ -10,6 +10,8 @@ import requests
 
 BASE_URL = "https://quantapi.51ifind.com/api/v1"
 REFRESH_TOKEN_ENV = "THS_HTTP_REFRESH_TOKEN"
+_MAX_ERROR_CODE_CHARS = 32
+_MAX_ERROR_CODE_INT_BITS = 107
 _NUMERIC_ERROR_CODE_RE = re.compile(
     r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
 )
@@ -132,11 +134,20 @@ def join_if_sequence(value):
 def _safe_error_code(value) -> str:
     if isinstance(value, bool):
         return "unknown"
-    if isinstance(value, (int, float)):
-        return str(value) if math.isfinite(value) else "unknown"
+    if isinstance(value, int):
+        if value.bit_length() > _MAX_ERROR_CODE_INT_BITS:
+            return "unknown"
+        rendered = str(value)
+        return rendered if len(rendered) <= _MAX_ERROR_CODE_CHARS else "unknown"
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return "unknown"
+        rendered = str(value)
+        return rendered if len(rendered) <= _MAX_ERROR_CODE_CHARS else "unknown"
     if isinstance(value, str):
         value = value.strip()
-        if len(value) <= 32 and _NUMERIC_ERROR_CODE_RE.fullmatch(value):
+        if (len(value) <= _MAX_ERROR_CODE_CHARS
+                and _NUMERIC_ERROR_CODE_RE.fullmatch(value)):
             return value
     return "unknown"
 

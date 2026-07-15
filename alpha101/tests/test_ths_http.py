@@ -58,3 +58,15 @@ def test_api_error_never_stringifies_nested_credential_bearing_error_code():
 
     assert str(caught.value) == "iFinD HTTP API error unknown"
     assert secret not in str(caught.value)
+
+
+@pytest.mark.parametrize(("errorcode", "rendered"), [
+    (10 ** 5000, "unknown"),
+    ("9" * 40, "unknown"),
+    ("429", "429"),
+], ids=["large-integer", "overlong-numeric-string", "short-numeric-string"])
+def test_api_error_code_rendering_is_total_and_bounded(errorcode, rendered):
+    with pytest.raises(RuntimeError) as caught:
+        ths_http.raise_for_api_error({"errorcode": errorcode})
+
+    assert str(caught.value) == f"iFinD HTTP API error {rendered}"

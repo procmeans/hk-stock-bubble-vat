@@ -41,11 +41,13 @@ _QUOTED_CREDENTIAL_RE = re.compile(
     flags=re.IGNORECASE | re.DOTALL,
 )
 _UNQUOTED_AUTHORIZATION_RE = re.compile(
-    r"(\bauthorization\b\s*[:=]\s*)[^,;}\]\r\n]+",
+    r"([\"']?\bauthorization\b[\"']?\s*[:=]\s*)"
+    r"(?!\[REDACTED\])[^,;}\]\r\n]+",
     flags=re.IGNORECASE,
 )
 _PLAIN_CREDENTIAL_RE = re.compile(
-    rf"(\b{_CREDENTIAL_FIELD}\b\s*[:=]\s*)(?:Bearer\s+)?[^\s,;}}\]]+",
+    rf"(\b{_CREDENTIAL_FIELD}\b\s*[:=]\s*)"
+    rf"(?!\[REDACTED\])(?:Bearer\s+)?[^\s,;}}\]]+",
     flags=re.IGNORECASE,
 )
 _BEARER_RE = re.compile(
