@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from strategies import momentum
+from strategies import momentum, ths_heat
 
 PARAMS = {"top_n": 40, "lookback": 126, "skip": 21, "rebalance": 21}
 A101_PARAMS = {"top_n": 50, "rebalance": 5}
@@ -27,6 +27,10 @@ FETCH_SIZE = 800
 WINDOW_DAYS = 400
 PAPER_DIR = Path("paper")
 CURRENCIES = {"us": "$", "hk": "HK$", "a": "¥"}
+HEAT_SIGNAL_COLUMNS = [
+    "date", "strategy", "rank", "ticker", "name", "factor_value",
+    "status", "error",
+]
 
 
 def account_dir(account: str) -> Path:
@@ -241,11 +245,18 @@ def _market_panel(market: str, held: set, fetch=None) -> dict:
     if market == "a":
         codes = sorted(set(a_universe_tickers()) | held)
         panel = (fetch or fetch_a_panel)(codes, window_days=WINDOW_DAYS)
-        adv = panel["amount"].tail(60).mean().nlargest(UNIVERSE_SIZE).index
-        keep = set(adv) | held
-        return {key: value[[c for c in value.columns if c in keep]]
-                if isinstance(value, pd.DataFrame) else value
-                for key, value in panel.items()}
+        benchmark_codes = panel["amount"].tail(60).mean() \
+            .nlargest(UNIVERSE_SIZE).index.tolist()
+        keep = set(benchmark_codes) | held
+        result = {
+            key: value[[column for column in value.columns if column in keep]]
+            if isinstance(value, pd.DataFrame) else value
+            for key, value in panel.items()
+        }
+        result["benchmark_close"] = panel["close"].reindex(
+            columns=benchmark_codes
+        )
+        return result
     codes = sorted(set(universe_tickers()) | held)
     close, volume = (fetch or fetch_close_volume)(codes, window_days=WINDOW_DAYS)
     adv = (close * volume).tail(60).mean().nlargest(UNIVERSE_SIZE).index
@@ -257,8 +268,102 @@ def _held(state: dict) -> set:
     return set(state["positions"]) | set(state["pending_targets"] or {})
 
 
-def _step_and_persist(account: str, state: dict, panel: dict) -> None:
-    state, nav_row, orders = step(state, panel)
+def _merge_panel(base, extra):
+    merged = dict(base)
+    for key, value in extra.items():
+        if (isinstance(value, pd.DataFrame)
+                and isinstance(merged.get(key), pd.DataFrame)):
+            merged[key] = merged[key].combine_first(value)
+        else:
+            merged.setdefault(key, value)
+    return merged
+
+
+def _error_row(date, strategy, error):
+    return {
+        "date": date, "strategy": strategy, "rank": "", "ticker": "",
+        "name": "", "factor_value": "", "status": "error",
+        "error": " ".join(str(error).split())[:300],
+    }
+
+
+def append_heat_signals(rows, path=None):
+    if not rows:
+        return
+    path = path or PAPER_DIR / "ths_heat_signals.csv"
+    incoming = pd.DataFrame(rows, columns=HEAT_SIGNAL_COLUMNS)
+    existing = pd.read_csv(path, dtype={"ticker": str}) \
+        if path.exists() and path.stat().st_size else pd.DataFrame()
+    combined = pd.concat([existing, incoming], ignore_index=True)
+    dedupe_columns = ["date", "strategy", "rank", "ticker", "status"]
+    combined[dedupe_columns] = combined[dedupe_columns].fillna("")
+    combined = combined.drop_duplicates(dedupe_columns, keep="first")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_csv(path, index=False)
+
+
+def prepare_heat_targets(states, panel, fetch_panel, fetch_signal=None):
+    signal_date = panel["close"].index[-1]
+    date_text = signal_date.strftime("%Y-%m-%d")
+    due = {
+        account: state for account, state in states.items()
+        if state.get("strategy") in HEAT_STRATEGIES
+        and state.get("last_run") != date_text and rebalance_due(state)
+    }
+    if not due:
+        return panel, {}, []
+    loader = fetch_signal or ths_heat.fetch_signal
+    signals, audit = {}, []
+    for strategy in sorted({state["strategy"] for state in due.values()}):
+        top_n = next(
+            state["params"]["top_n"] for state in due.values()
+            if state["strategy"] == strategy
+        )
+        try:
+            signals[strategy] = loader(signal_date, strategy, top_n=top_n)
+        except Exception as error:
+            audit.append(_error_row(date_text, strategy, error))
+    missing = sorted({
+        ticker for signal in signals.values()
+        for ticker in signal["ticker"].astype(str)
+        if ticker not in panel["close"].columns
+    })
+    if missing:
+        try:
+            panel = _merge_panel(
+                panel, fetch_panel(missing, window_days=WINDOW_DAYS)
+            )
+        except Exception as error:
+            for strategy in sorted(signals):
+                audit.append(_error_row(date_text, strategy, error))
+    prices = panel["close"].ffill().iloc[-1]
+    overrides = {}
+    for account, state in due.items():
+        strategy = state["strategy"]
+        signal = signals.get(strategy)
+        if signal is None:
+            overrides[account] = {}
+            continue
+        weights = ths_heat.target_weights(signal, prices)
+        overrides[account] = weights
+        used = signal[signal["ticker"].isin(weights)]
+        if used.empty:
+            audit.append(_error_row(
+                date_text, strategy,
+                RuntimeError("no heat picks have valid prices")
+            ))
+        else:
+            audit.extend(
+                {**row, "status": "ok", "error": ""}
+                for row in used.to_dict("records")
+            )
+    return panel, overrides, audit
+
+
+def _step_and_persist(account, state, panel, target_override=None):
+    state, nav_row, orders = step(
+        state, panel, target_override=target_override
+    )
     if nav_row is None:
         print(f"{account}: {state['last_run']} 已运行过,跳过")
         return
@@ -275,14 +380,22 @@ def _step_and_persist(account: str, state: dict, panel: dict) -> None:
           f"挂单 {pending} 只")
 
 
-def run(account: str = "us_momentum", fetch=None) -> None:
+def run(account="us_momentum", fetch=None, heat_fetch=None):
     state = load_state(account)
-    panel = _market_panel(state.get("market", "us"), _held(state), fetch=fetch)
-    _step_and_persist(account, state, panel)
+    market = state.get("market", "us")
+    panel = _market_panel(market, _held(state), fetch=fetch)
+    overrides, audit = {}, []
+    if market == "a":
+        panel, overrides, audit = prepare_heat_targets(
+            {account: state}, panel, fetch or fetch_a_panel,
+            fetch_signal=heat_fetch,
+        )
+        append_heat_signals(audit)
+    _step_and_persist(account, state, panel, overrides.get(account))
 
 
-def run_market(market: str, fetch=None) -> None:
-    """同市场所有账户共用一次抓数(iFinD 配额不随账户数增长)。"""
+def run_market(market, fetch=None, heat_fetch=None):
+    """同市场账户共用基础抓数，热度策略仅在到期日预取信号。"""
     manifest = PAPER_DIR / "accounts.json"
     entries = json.loads(manifest.read_text()) if manifest.exists() else []
     states = {
@@ -296,8 +409,14 @@ def run_market(market: str, fetch=None) -> None:
     for state in states.values():
         held |= _held(state)
     panel = _market_panel(market, held, fetch=fetch)
+    overrides, audit = {}, []
+    if market == "a":
+        panel, overrides, audit = prepare_heat_targets(
+            states, panel, fetch or fetch_a_panel, fetch_signal=heat_fetch
+        )
+        append_heat_signals(audit)
     for account, state in states.items():
-        _step_and_persist(account, state, panel)
+        _step_and_persist(account, state, panel, overrides.get(account))
 
 
 def status(account: str = "us_momentum") -> None:

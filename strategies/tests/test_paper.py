@@ -226,3 +226,105 @@ def test_failed_due_heat_signal_stays_due_for_next_day():
     state, _, _ = paper.step(state, {"close": _close()}, target_override={})
     assert state["pending_targets"] is None
     assert paper.rebalance_due(state) is True
+
+
+def _a_panel(columns=("A", "B"), n=20):
+    base = _close(n)
+    close = pd.DataFrame(index=base.index)
+    for column in columns:
+        close[column] = base[column] if column in base else 50.0
+    return {
+        "close": close, "volume": close * 0 + 1000.0,
+        "amount": close * 1000.0, "returns": close.pct_change(),
+    }
+
+
+def _signal(strategy, ticker, value):
+    return pd.DataFrame([{
+        "date": "2024-01-26", "strategy": strategy, "rank": 1,
+        "ticker": ticker, "name": ticker, "factor_value": value,
+    }])
+
+
+def test_run_market_fetches_due_heat_once_and_supplements_prices(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(paper, "PAPER_DIR", tmp_path)
+    paper.init("heat", 100000.0, strategy="ths_heat", market="a")
+    paper.init("rise", 100000.0, strategy="ths_heat_rise", market="a")
+    monkeypatch.setattr(paper, "a_universe_tickers", lambda: ["A", "B"])
+    panel_calls, signal_calls = [], []
+
+    def fake_panel(codes, window_days=0):
+        panel_calls.append(set(codes))
+        return _a_panel(tuple(sorted(codes))) if set(codes) <= {"C", "D"} else _a_panel()
+
+    def fake_signal(day, strategy, top_n=20):
+        signal_calls.append((strategy, top_n))
+        return _signal(strategy, "C" if strategy == "ths_heat" else "D", 9.0)
+
+    paper.run_market("a", fetch=fake_panel, heat_fetch=fake_signal)
+    assert len(panel_calls) == 2 and panel_calls[1] == {"C", "D"}
+    assert {item[0] for item in signal_calls} == {"ths_heat", "ths_heat_rise"}
+    assert paper.load_state("heat")["pending_targets"] == {"C": 1.0}
+    assert paper.load_state("rise")["pending_targets"] == {"D": 1.0}
+
+
+def test_heat_query_failure_isolated_per_account(tmp_path, monkeypatch):
+    monkeypatch.setattr(paper, "PAPER_DIR", tmp_path)
+    paper.init("heat", 100000.0, strategy="ths_heat", market="a")
+    paper.init("rise", 100000.0, strategy="ths_heat_rise", market="a")
+    paper.init(
+        "plain", 100000.0, strategy="momentum", market="a",
+        params={"top_n": 1, "lookback": 10, "skip": 2, "rebalance": 5},
+    )
+    monkeypatch.setattr(paper, "a_universe_tickers", lambda: ["A", "B"])
+
+    def fake_signal(day, strategy, top_n=20):
+        if strategy == "ths_heat":
+            raise RuntimeError("temporary API failure")
+        return _signal(strategy, "A", 8.0)
+
+    paper.run_market(
+        "a", fetch=lambda codes, window_days=0: _a_panel(),
+        heat_fetch=fake_signal,
+    )
+    assert paper.load_state("heat")["pending_targets"] is None
+    assert paper.load_state("rise")["pending_targets"] == {"A": 1.0}
+    assert paper.load_state("plain")["last_run"] == "2024-01-26"
+    audit = pd.read_csv(tmp_path / "ths_heat_signals.csv")
+    assert set(audit["status"]) == {"ok", "error"}
+
+
+def test_non_due_heat_account_does_not_query(tmp_path, monkeypatch):
+    monkeypatch.setattr(paper, "PAPER_DIR", tmp_path)
+    paper.init("heat", 100000.0, strategy="ths_heat", market="a")
+    state = paper.load_state("heat")
+    state["days_since_rebalance"] = 0
+    paper.save_state("heat", state)
+    monkeypatch.setattr(paper, "a_universe_tickers", lambda: ["A", "B"])
+    paper.run_market(
+        "a", fetch=lambda codes, window_days=0: _a_panel(),
+        heat_fetch=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("heat endpoint called on non-due day")
+        ),
+    )
+
+
+def test_append_heat_signals_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setattr(paper, "PAPER_DIR", tmp_path)
+    rows = [
+        {
+            "date": "2026-07-15", "strategy": "ths_heat", "rank": 1,
+            "ticker": "000001", "name": "甲", "factor_value": 100.0,
+            "status": "ok", "error": "",
+        },
+        {
+            "date": "2026-07-15", "strategy": "ths_heat", "rank": "",
+            "ticker": "", "name": "", "factor_value": "",
+            "status": "error", "error": "temporary API failure",
+        },
+    ]
+    paper.append_heat_signals(rows)
+    paper.append_heat_signals(rows)
+    assert len(pd.read_csv(tmp_path / "ths_heat_signals.csv")) == 2
