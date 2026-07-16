@@ -421,11 +421,12 @@ def test_partition_is_complete_with_explicit_no_data(monkeypatch, tmp_path):
         "amount": [1_000.0],
     })
     written_paths = []
+    real_to_parquet = pd.DataFrame.to_parquet
 
     def write_fake_parquet(self, path, index):
         path = Path(path)
         written_paths.append(path)
-        path.write_text("parquet payload")
+        real_to_parquet(self, path, index=index)
 
     monkeypatch.setattr(pd.DataFrame, "to_parquet", write_fake_parquet)
 
@@ -436,8 +437,11 @@ def test_partition_is_complete_with_explicit_no_data(monkeypatch, tmp_path):
         tmp_path,
     )
 
-    assert written_paths == [parquet.with_suffix(".parquet.tmp")]
-    assert parquet.read_text() == "parquet payload"
+    assert written_paths == [
+        parquet.with_suffix(".parquet.tmp"),
+        tmp_path / "minute" / "2026-01-12.coverage.parquet.tmp",
+    ]
+    assert pd.read_parquet(parquet).equals(frame)
     assert json.loads(manifest.read_text()) == {
         "date": "2026-01-12",
         "statuses": {"000001": "returned", "000002": "no_data"},
@@ -447,6 +451,112 @@ def test_partition_is_complete_with_explicit_no_data(monkeypatch, tmp_path):
     assert day_complete(day, ["000001", "000002"], tmp_path)
     assert not day_complete(day, ["000001", "000002", "000003"], tmp_path)
     assert not day_complete(day, ["000001"], tmp_path)
+
+
+def _daily_coverage(day, rows):
+    return pd.DataFrame(
+        [
+            {
+                "date": day,
+                "code": code,
+                "minute_count": count,
+                "amount_relative_error": amount_error,
+                "reason": reason,
+            }
+            for code, count, amount_error, reason in rows
+        ],
+        columns=intraday_data.COVERAGE_COLUMNS,
+    )
+
+
+def test_write_day_partition_publishes_exact_daily_coverage(tmp_path):
+    day = pd.Timestamp("2026-01-12")
+    frame = _minute_frame(count=200, amount=5.0).assign(code="000001")[
+        intraday_data.MINUTE_COLUMNS
+    ]
+    coverage = _daily_coverage(
+        day,
+        [
+            ("000001", 200, 0.0, "ok"),
+            ("000002", 0, np.nan, "no_data"),
+        ],
+    )
+
+    write_day_partition(
+        frame,
+        {"000001": "returned", "000002": "no_data"},
+        day,
+        tmp_path,
+        coverage=coverage,
+    )
+
+    sidecar = tmp_path / "minute" / "2026-01-12.coverage.parquet"
+    assert sidecar.is_file()
+    stored = pd.read_parquet(sidecar)
+    assert stored["code"].tolist() == ["000001", "000002"]
+    assert day_complete(day, ["000001", "000002"], tmp_path)
+
+
+def test_legacy_partition_without_daily_coverage_is_incomplete(tmp_path):
+    day = pd.Timestamp("2026-01-12")
+    directory = tmp_path / "minute"
+    directory.mkdir()
+    pd.DataFrame({"code": ["000001"]}).to_parquet(
+        directory / "2026-01-12.parquet",
+        index=False,
+    )
+    (directory / "2026-01-12.json").write_text(
+        json.dumps(
+            {"date": "2026-01-12", "statuses": {"000001": "returned"}}
+        ),
+        encoding="utf-8",
+    )
+
+    assert not day_complete(day, ["000001"], tmp_path)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing_column", "wrong_date", "missing_code", "status_reason"],
+)
+def test_day_complete_rejects_corrupt_daily_coverage(tmp_path, corruption):
+    day = pd.Timestamp("2026-01-12")
+    directory = tmp_path / "minute"
+    directory.mkdir()
+    pd.DataFrame({"code": ["000001", "000002"]}).to_parquet(
+        directory / "2026-01-12.parquet",
+        index=False,
+    )
+    (directory / "2026-01-12.json").write_text(
+        json.dumps(
+            {
+                "date": "2026-01-12",
+                "statuses": {"000001": "returned", "000002": "no_data"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    coverage = _daily_coverage(
+        day,
+        [
+            ("000001", 200, 0.0, "ok"),
+            ("000002", 0, np.nan, "no_data"),
+        ],
+    )
+    if corruption == "missing_column":
+        coverage = coverage.drop(columns="reason")
+    elif corruption == "wrong_date":
+        coverage.loc[0, "date"] = day + pd.Timedelta(days=1)
+    elif corruption == "missing_code":
+        coverage = coverage.iloc[:1]
+    else:
+        coverage.loc[coverage["code"].eq("000002"), "reason"] = "ok"
+    coverage.to_parquet(
+        directory / "2026-01-12.coverage.parquet",
+        index=False,
+    )
+
+    assert not day_complete(day, ["000001", "000002"], tmp_path)
 
 
 def test_day_complete_rejects_missing_files_and_unknown_status(monkeypatch, tmp_path):
@@ -581,7 +691,7 @@ def test_partition_does_not_publish_when_staging_fails(monkeypatch, tmp_path):
     assert not (partition_dir / "2026-01-12.json").exists()
 
 
-@pytest.mark.parametrize("failed_stage", ["parquet", "manifest"])
+@pytest.mark.parametrize("failed_stage", ["parquet", "coverage", "manifest"])
 def test_existing_partition_survives_staging_failure(
     monkeypatch,
     tmp_path,
@@ -589,9 +699,14 @@ def test_existing_partition_survives_staging_failure(
 ):
     day = pd.Timestamp("2026-01-12")
     original_write_text = Path.write_text
+    real_to_parquet = pd.DataFrame.to_parquet
 
     def write_fake_parquet(self, path, index):
-        original_write_text(Path(path), str(self.loc[self.index[0], "close"]))
+        path = Path(path)
+        if "close" in self:
+            original_write_text(path, str(self.loc[self.index[0], "close"]))
+        else:
+            real_to_parquet(self, path, index=index)
 
     monkeypatch.setattr(pd.DataFrame, "to_parquet", write_fake_parquet)
     old_frame = pd.DataFrame({"code": ["000001"], "close": [10.0]})
@@ -602,13 +717,17 @@ def test_existing_partition_survives_staging_failure(
 
     failure_pending = True
 
-    if failed_stage == "parquet":
+    if failed_stage in {"parquet", "coverage"}:
         def fail_staging_parquet(self, path, index):
             nonlocal failure_pending
             write_fake_parquet(self, path, index)
-            if failure_pending:
+            is_coverage = ".coverage.parquet.tmp" in str(path)
+            should_fail = (
+                failed_stage == "coverage" if is_coverage else failed_stage == "parquet"
+            )
+            if should_fail and failure_pending:
                 failure_pending = False
-                raise OSError("simulated parquet staging failure")
+                raise OSError(f"simulated {failed_stage} staging failure")
 
         monkeypatch.setattr(pd.DataFrame, "to_parquet", fail_staging_parquet)
     else:
@@ -637,9 +756,14 @@ def test_existing_partition_survives_manifest_invalidation_failure(
     tmp_path,
 ):
     day = pd.Timestamp("2026-01-12")
+    real_to_parquet = pd.DataFrame.to_parquet
 
     def write_fake_parquet(self, path, index):
-        Path(path).write_text(str(self.loc[self.index[0], "close"]))
+        path = Path(path)
+        if "close" in self:
+            path.write_text(str(self.loc[self.index[0], "close"]))
+        else:
+            real_to_parquet(self, path, index=index)
 
     monkeypatch.setattr(pd.DataFrame, "to_parquet", write_fake_parquet)
     old_frame = pd.DataFrame({"code": ["000001"], "close": [10.0]})
@@ -682,9 +806,14 @@ def test_orphaned_previous_manifest_never_completes_and_retry_cleans_it(
     tmp_path,
 ):
     day = pd.Timestamp("2026-01-12")
+    real_to_parquet = pd.DataFrame.to_parquet
 
     def write_fake_parquet(self, path, index):
-        Path(path).write_text(str(self.loc[self.index[0], "close"]))
+        path = Path(path)
+        if "close" in self:
+            path.write_text(str(self.loc[self.index[0], "close"]))
+        else:
+            real_to_parquet(self, path, index=index)
 
     monkeypatch.setattr(pd.DataFrame, "to_parquet", write_fake_parquet)
     old_frame = pd.DataFrame({"code": ["000001"], "close": [10.0]})
@@ -705,16 +834,24 @@ def test_orphaned_previous_manifest_never_completes_and_retry_cleans_it(
     assert not previous_manifest.exists()
 
 
-@pytest.mark.parametrize("failed_suffix", [".parquet.tmp", ".json.tmp"])
+@pytest.mark.parametrize(
+    "failed_suffix",
+    ["2026-01-12.parquet.tmp", ".coverage.parquet.tmp", ".json.tmp"],
+)
 def test_existing_partition_is_invalidated_when_publish_fails_and_retry_recovers(
     monkeypatch,
     tmp_path,
     failed_suffix,
 ):
     day = pd.Timestamp("2026-01-12")
+    real_to_parquet = pd.DataFrame.to_parquet
 
     def write_fake_parquet(self, path, index):
-        Path(path).write_text(str(self.loc[self.index[0], "close"]))
+        path = Path(path)
+        if "close" in self:
+            path.write_text(str(self.loc[self.index[0], "close"]))
+        else:
+            real_to_parquet(self, path, index=index)
 
     monkeypatch.setattr(pd.DataFrame, "to_parquet", write_fake_parquet)
     old_frame = pd.DataFrame({"code": ["000001"], "close": [10.0]})
@@ -747,6 +884,7 @@ def test_existing_partition_is_invalidated_when_publish_fails_and_retry_recovers
     assert day_complete(day, ["000001"], tmp_path)
     assert parquet.read_text() == "20.0"
     assert not previous_manifest.exists()
+    assert not list((tmp_path / "minute").glob("*.tmp"))
 
 
 def _http_error(status):
@@ -845,8 +983,6 @@ def test_fetch_minute_batches_codes_with_market_suffixes_and_exact_parameters(
 
     monkeypatch.setattr(intraday_data.ths_http, "high_frequency",
                         fake_high_frequency)
-    monkeypatch.setattr(pd.DataFrame, "to_parquet",
-                        lambda self, path, index: Path(path).write_text("empty"))
 
     result = intraday_data.fetch_minute_partitions(
         plan, raw_daily, tmp_path, "token", batch_size=2
@@ -869,7 +1005,8 @@ def test_fetch_minute_batches_codes_with_market_suffixes_and_exact_parameters(
         },
         "access_token": "token",
     } for call in calls)
-    assert result.empty
+    assert result["reason"].eq("no_data").all()
+    assert set(result["code"]) == {"000001", "600000", "430001", "920001"}
     assert day_complete(
         day, ["000001", "600000", "430001", "920001"], tmp_path
     )
@@ -902,8 +1039,8 @@ def test_fetch_minute_records_partial_statuses_and_reconciles_cps1_amount(
     monkeypatch.setattr(
         intraday_data,
         "write_day_partition",
-        lambda frame, statuses, candidate_day, root: written.append(
-            (frame.copy(), statuses.copy(), candidate_day, root)
+        lambda frame, statuses, candidate_day, root, coverage: written.append(
+            (frame.copy(), statuses.copy(), candidate_day, root, coverage.copy())
         ),
     )
 
@@ -911,7 +1048,7 @@ def test_fetch_minute_records_partial_statuses_and_reconciles_cps1_amount(
         plan, raw_daily, tmp_path, "token", batch_size=2
     )
 
-    clean, statuses, written_day, written_root = written[0]
+    clean, statuses, written_day, written_root, daily_coverage = written[0]
     assert statuses == {
         "000001": "returned",
         "000002": "no_data",
@@ -922,8 +1059,11 @@ def test_fetch_minute_records_partial_statuses_and_reconciles_cps1_amount(
     assert clean["amount"].sum() == 1_000.0
     assert clean["volume"].sum() == 200.0
     assert coverage[["code", "reason"]].to_dict("records") == [
-        {"code": "000001", "reason": "ok"}
+        {"code": "000001", "reason": "ok"},
+        {"code": "000002", "reason": "no_data"},
+        {"code": "600000", "reason": "no_data"},
     ]
+    pd.testing.assert_frame_equal(coverage, daily_coverage)
 
 
 def test_fetch_minute_skips_completed_day(monkeypatch, tmp_path):
@@ -938,8 +1078,6 @@ def test_fetch_minute_skips_completed_day(monkeypatch, tmp_path):
         "amount": [1_000.0],
     })
     empty = pd.DataFrame(columns=["code", "time", "close", "volume", "amount"])
-    monkeypatch.setattr(pd.DataFrame, "to_parquet",
-                        lambda self, path, index: Path(path).write_text("empty"))
     write_day_partition(empty, {"000001": "no_data"}, day, tmp_path)
     calls = []
     monkeypatch.setattr(
@@ -971,8 +1109,8 @@ def test_fetch_minute_handles_empty_candidate_batch_without_request(
     monkeypatch.setattr(
         intraday_data,
         "write_day_partition",
-        lambda frame, statuses, candidate_day, root: written.append(
-            (frame.copy(), statuses.copy())
+        lambda frame, statuses, candidate_day, root, coverage: written.append(
+            (frame.copy(), statuses.copy(), coverage.copy())
         ),
     )
 
@@ -987,7 +1125,89 @@ def test_fetch_minute_handles_empty_candidate_batch_without_request(
     assert len(written) == 1
     assert written[0][0].empty
     assert written[0][1] == {}
+    assert written[0][2].empty
     assert result.empty
+
+
+def test_fetch_minute_resumes_after_later_day_failure_from_daily_sidecar(
+    monkeypatch,
+    tmp_path,
+):
+    days = pd.bdate_range("2026-01-12", periods=2)
+    plan = {
+        "candidates": ["000001"],
+        "fetch_dates": days,
+    }
+    raw_daily = pd.DataFrame(
+        {"code": "000001", "date": days, "amount": 1_000.0}
+    )
+    first_calls = []
+
+    def fail_on_second_day(codes, indicators, starttime, endtime, **kwargs):
+        day = pd.Timestamp(starttime[:10])
+        first_calls.append(day)
+        if day == days[1]:
+            raise requests.Timeout("second day interrupted")
+        frame = _minute_frame(count=200, amount=5.0)
+        frame["time"] = frame["time"] + (day - days[0])
+        return frame
+
+    monkeypatch.setattr(
+        intraday_data.ths_http,
+        "high_frequency",
+        fail_on_second_day,
+    )
+    monkeypatch.setattr(intraday_data.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(requests.Timeout, match="second day interrupted"):
+        intraday_data.fetch_minute_partitions(
+            plan,
+            raw_daily,
+            tmp_path,
+            "token",
+        )
+
+    assert first_calls.count(days[0]) == 1
+    assert first_calls.count(days[1]) == 4
+    assert day_complete(days[0], ["000001"], tmp_path)
+    assert (tmp_path / "minute" / "2026-01-12.coverage.parquet").is_file()
+
+    retry_calls = []
+
+    def retry_second_day(codes, indicators, starttime, endtime, **kwargs):
+        day = pd.Timestamp(starttime[:10])
+        retry_calls.append(day)
+        frame = _minute_frame(count=200, amount=5.0)
+        frame["time"] = frame["time"] + (day - days[0])
+        return frame
+
+    monkeypatch.setattr(
+        intraday_data.ths_http,
+        "high_frequency",
+        retry_second_day,
+    )
+    fetched = intraday_data.fetch_minute_partitions(
+        plan,
+        raw_daily,
+        tmp_path,
+        "token",
+    )
+
+    assert retry_calls == [days[1]]
+    assert fetched[["date", "code"]].to_dict("records") == [
+        {"date": days[1], "code": "000001"}
+    ]
+    recovered = pd.concat(
+        [
+            intraday_data.read_day_coverage(day, ["000001"], tmp_path)
+            for day in days
+        ],
+        ignore_index=True,
+    )
+    assert recovered[["date", "code"]].to_dict("records") == [
+        {"date": days[0], "code": "000001"},
+        {"date": days[1], "code": "000001"},
+    ]
 
 
 def test_fetch_adjusted_daily_uses_cps3_batches_and_normalizes(monkeypatch):
@@ -1392,8 +1612,8 @@ def test_fetch_minute_rejects_malformed_wrong_market_and_unrequested_rows(
     monkeypatch.setattr(
         intraday_data,
         "write_day_partition",
-        lambda frame, statuses, candidate_day, root: written.append(
-            (frame.copy(), statuses.copy())
+        lambda frame, statuses, candidate_day, root, coverage: written.append(
+            (frame.copy(), statuses.copy(), coverage.copy())
         ),
     )
 
@@ -1408,10 +1628,11 @@ def test_fetch_minute_rejects_malformed_wrong_market_and_unrequested_rows(
         "token",
     )
 
-    clean, statuses = written[0]
+    clean, statuses, daily_coverage = written[0]
     assert statuses == {"000001": "returned", "000002": "no_data"}
     assert clean["code"].unique().tolist() == ["000001"]
-    assert coverage["code"].tolist() == ["000001"]
+    assert coverage["code"].tolist() == ["000001", "000002"]
+    pd.testing.assert_frame_equal(coverage, daily_coverage)
 
 
 @pytest.mark.parametrize("missing", ["code", "date", "amount"])
@@ -1456,8 +1677,8 @@ def test_fetch_minute_keeps_unusable_daily_amount_as_mismatch(
     monkeypatch.setattr(
         intraday_data,
         "write_day_partition",
-        lambda frame, statuses, candidate_day, root: written.append(
-            (frame.copy(), statuses.copy())
+        lambda frame, statuses, candidate_day, root, coverage: written.append(
+            (frame.copy(), statuses.copy(), coverage.copy())
         ),
     )
 
@@ -1477,6 +1698,7 @@ def test_fetch_minute_keeps_unusable_daily_amount_as_mismatch(
 
     assert written[0][0].empty
     assert written[0][1] == {"000001": "returned"}
+    pd.testing.assert_frame_equal(coverage, written[0][2])
     assert coverage[["code", "reason"]].to_dict("records") == [
         {"code": "000001", "reason": "amount_mismatch"}
     ]

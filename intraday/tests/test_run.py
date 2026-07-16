@@ -1100,6 +1100,34 @@ def _write_offline_validation_case(tmp_path):
     return args, dates, codes
 
 
+def test_complete_coverage_rebuilds_from_authoritative_daily_sidecars(tmp_path):
+    args, _, _ = _write_offline_validation_case(tmp_path)
+    plan = _load_plan(args.cache)
+    stale = pd.read_parquet(args.cache / "data_coverage.parquet")
+    stale.loc[stale.index[0], ["minute_count", "reason"]] = [0, "no_data"]
+    delta = stale.iloc[[0]].copy()
+
+    rebuilt = intraday_run._complete_coverage(
+        plan,
+        args.cache,
+        stale,
+        delta,
+    )
+
+    authoritative = pd.concat(
+        [
+            intraday_data.read_day_coverage(
+                day,
+                plan["candidates"],
+                args.cache,
+            )
+            for day in plan["fetch_dates"]
+        ],
+        ignore_index=True,
+    ).sort_values(["date", "code"]).reset_index(drop=True)
+    pd.testing.assert_frame_equal(rebuilt, authoritative)
+
+
 def test_validate_offline_end_to_end_preserves_cache_and_t_plus_one_cost(
     tmp_path,
     monkeypatch,
@@ -1227,10 +1255,16 @@ def test_validate_rejects_minute_partition_coverage_inconsistency(
 ):
     args, dates, codes = _write_offline_validation_case(tmp_path)
     parquet_path, manifest_path = intraday_data._day_paths(dates[0], args.cache)
+    sidecar_path = intraday_data._day_coverage_path(dates[0], args.cache)
     coverage_path = args.cache / "data_coverage.parquet"
     minute = pd.read_parquet(parquet_path)
+    daily_coverage = pd.read_parquet(sidecar_path)
     coverage = pd.read_parquet(coverage_path)
     first = coverage["date"].eq(dates[0]) & coverage["code"].eq(codes[0])
+    daily_first = (
+        daily_coverage["date"].eq(dates[0])
+        & daily_coverage["code"].eq(codes[0])
+    )
 
     if case == "empty_ok_partition":
         minute = minute.iloc[0:0]
@@ -1238,8 +1272,10 @@ def test_validate_rejects_minute_partition_coverage_inconsistency(
         minute = minute.loc[minute["code"].ne(codes[0])]
     elif case == "fake_ok_count":
         coverage.loc[first, "minute_count"] = 201
+        daily_coverage.loc[daily_first, "minute_count"] = 201
     elif case == "failed_has_rows":
         coverage.loc[first, "reason"] = "too_few_trades"
+        daily_coverage.loc[daily_first, "reason"] = "too_few_trades"
     else:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["statuses"][codes[0]] = "no_data"
@@ -1248,14 +1284,20 @@ def test_validate_rejects_minute_partition_coverage_inconsistency(
             first,
             ["reason", "minute_count", "amount_relative_error"],
         ] = ["no_data", 0, np.nan]
+        daily_coverage.loc[
+            daily_first,
+            ["reason", "minute_count", "amount_relative_error"],
+        ] = ["no_data", 0, np.nan]
         if case == "no_data_nonzero_count":
             coverage.loc[first, "minute_count"] = 1
+            daily_coverage.loc[daily_first, "minute_count"] = 1
             minute = minute.loc[minute["code"].ne(codes[0])]
 
     minute.to_parquet(parquet_path, index=False)
+    daily_coverage.to_parquet(sidecar_path, index=False)
     coverage.to_parquet(coverage_path, index=False)
 
-    with pytest.raises(ValueError, match=r"minute (coverage|partition)"):
+    with pytest.raises(ValueError, match=r"minute (coverage|partition|manifest)"):
         run_validate(args)
 
 
@@ -1277,18 +1319,29 @@ def test_validate_rejects_impossible_coverage_reason_thresholds(
 ):
     args, dates, codes = _write_offline_validation_case(tmp_path)
     parquet_path, _ = intraday_data._day_paths(dates[0], args.cache)
+    sidecar_path = intraday_data._day_coverage_path(dates[0], args.cache)
     coverage_path = args.cache / "data_coverage.parquet"
     minute = pd.read_parquet(parquet_path)
+    daily_coverage = pd.read_parquet(sidecar_path)
     coverage = pd.read_parquet(coverage_path)
     first = coverage["date"].eq(dates[0]) & coverage["code"].eq(codes[0])
+    daily_first = (
+        daily_coverage["date"].eq(dates[0])
+        & daily_coverage["code"].eq(codes[0])
+    )
     coverage.loc[first, ["reason", "minute_count", "amount_relative_error"]] = [
         reason,
         count,
         amount_error,
     ]
+    daily_coverage.loc[
+        daily_first,
+        ["reason", "minute_count", "amount_relative_error"],
+    ] = [reason, count, amount_error]
     if reason != "ok":
         minute = minute.loc[minute["code"].ne(codes[0])]
     minute.to_parquet(parquet_path, index=False)
+    daily_coverage.to_parquet(sidecar_path, index=False)
     coverage.to_parquet(coverage_path, index=False)
 
     with pytest.raises(ValueError, match="minute coverage"):

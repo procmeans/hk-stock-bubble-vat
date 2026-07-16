@@ -328,13 +328,107 @@ def _day_paths(day, root) -> tuple[Path, Path]:
     return directory / f"{stem}.parquet", directory / f"{stem}.json"
 
 
+def _day_coverage_path(day, root) -> Path:
+    stem = pd.Timestamp(day).strftime("%Y-%m-%d")
+    return Path(root) / "minute" / f"{stem}.coverage.parquet"
+
+
+def _default_day_coverage(frame, statuses, day) -> pd.DataFrame:
+    if "code" in frame:
+        codes = _normalize_code_series(frame["code"], "minute partition")
+        counts = codes.value_counts()
+    else:
+        counts = pd.Series(dtype="int64")
+    rows = []
+    for code, status in sorted(statuses.items()):
+        no_data = status == "no_data"
+        rows.append(
+            {
+                "date": pd.Timestamp(day).normalize(),
+                "code": code,
+                "minute_count": 0 if no_data else int(counts.get(code, 0)),
+                "amount_relative_error": np.nan if no_data else 0.0,
+                "reason": "no_data" if no_data else "ok",
+            }
+        )
+    return pd.DataFrame(rows, columns=COVERAGE_COLUMNS)
+
+
+def _normalize_day_coverage(coverage, statuses, day) -> pd.DataFrame:
+    if list(coverage.columns) != COVERAGE_COLUMNS:
+        raise ValueError("daily coverage schema must exactly match coverage columns")
+    result = coverage.copy()
+    result["date"] = _normalize_dates(result["date"], "daily coverage")
+    result["code"] = _normalize_code_series(result["code"], "daily coverage")
+    if result.duplicated(["date", "code"]).any():
+        raise ValueError("daily coverage contains duplicate date/code rows")
+    expected_day = pd.Timestamp(day).normalize()
+    if not result["date"].eq(expected_day).all():
+        raise ValueError("daily coverage contains a different date")
+    if set(result["code"]) != set(statuses):
+        raise ValueError("daily coverage codes do not exactly match manifest")
+    result["minute_count"] = pd.to_numeric(
+        result["minute_count"],
+        errors="coerce",
+    )
+    valid_count = (
+        result["minute_count"].notna()
+        & result["minute_count"].ge(0)
+        & result["minute_count"].mod(1).eq(0)
+    )
+    if not valid_count.all():
+        raise ValueError("daily coverage contains invalid minute_count")
+    result["minute_count"] = result["minute_count"].astype("int64")
+    result["amount_relative_error"] = pd.to_numeric(
+        result["amount_relative_error"],
+        errors="coerce",
+    )
+    allowed_reasons = {
+        "ok",
+        "too_few_minutes",
+        "too_few_trades",
+        "amount_mismatch",
+        "no_data",
+    }
+    if not result["reason"].isin(allowed_reasons).all():
+        raise ValueError("daily coverage contains invalid reason")
+    indexed = result.set_index("code")
+    for code, status in statuses.items():
+        row = indexed.loc[code]
+        if status == "no_data":
+            if row["reason"] != "no_data" or int(row["minute_count"]) != 0:
+                raise ValueError("daily coverage conflicts with no_data status")
+        elif row["reason"] == "no_data":
+            raise ValueError("daily coverage conflicts with returned status")
+    return (
+        result.sort_values("code", kind="mergesort")
+        .reset_index(drop=True)
+        .astype(COVERAGE_DTYPES)
+    )
+
+
+def read_day_coverage(day, codes, root, statuses=None) -> pd.DataFrame:
+    """Read one exact daily coverage sidecar or raise ValueError."""
+    if statuses is None:
+        statuses = {code: "returned" for code in codes}
+    path = _day_coverage_path(day, root)
+    try:
+        frame = pd.read_parquet(path)
+    except Exception as exc:
+        raise ValueError(
+            f"daily coverage is unreadable for {pd.Timestamp(day).date()}"
+        ) from exc
+    return _normalize_day_coverage(frame, statuses, day)
+
+
 def write_day_partition(
     frame: pd.DataFrame,
     statuses,
     day,
     root,
+    coverage=None,
 ) -> tuple[Path, Path]:
-    """Stage and atomically replace one day's data and completion manifest."""
+    """Atomically publish minute data, daily coverage, then completion."""
     normalized_statuses = {}
     for value, status in statuses.items():
         code = _normalize_code(value)
@@ -342,13 +436,28 @@ def write_day_partition(
             raise ValueError(f"duplicate manifest stock code: {code}")
         normalized_statuses[code] = status
 
+    if coverage is None:
+        coverage = _default_day_coverage(
+            frame,
+            normalized_statuses,
+            day,
+        )
+    coverage = _normalize_day_coverage(
+        coverage,
+        normalized_statuses,
+        day,
+    )
+
     parquet, manifest = _day_paths(day, root)
+    coverage_path = _day_coverage_path(day, root)
     parquet.parent.mkdir(parents=True, exist_ok=True)
     temp_parquet = parquet.with_suffix(".parquet.tmp")
+    temp_coverage = coverage_path.with_suffix(".parquet.tmp")
     temp_manifest = manifest.with_suffix(".json.tmp")
     previous_manifest = manifest.with_suffix(".json.previous")
 
     frame.to_parquet(temp_parquet, index=False)
+    coverage.to_parquet(temp_coverage, index=False)
     temp_manifest.write_text(
         json.dumps(
                 {
@@ -363,6 +472,7 @@ def write_day_partition(
     if manifest.exists():
         manifest.replace(previous_manifest)
     temp_parquet.replace(parquet)
+    temp_coverage.replace(coverage_path)
     temp_manifest.replace(manifest)
     try:
         previous_manifest.unlink()
@@ -374,7 +484,8 @@ def write_day_partition(
 def day_complete(day, codes, root) -> bool:
     """Return whether the day exactly covers the requested code collection."""
     parquet, manifest = _day_paths(day, root)
-    if not parquet.exists() or not manifest.exists():
+    coverage_path = _day_coverage_path(day, root)
+    if not parquet.exists() or not coverage_path.exists() or not manifest.exists():
         return False
     try:
         payload = json.loads(manifest.read_text(encoding="utf-8"))
@@ -403,7 +514,18 @@ def day_complete(day, codes, root) -> bool:
         return False
     if not all(isinstance(code, str) for code in requested_codes):
         return False
-    return set(statuses) == set(requested_codes)
+    if set(statuses) != set(requested_codes):
+        return False
+    try:
+        read_day_coverage(
+            day,
+            requested_codes,
+            root,
+            statuses=statuses,
+        )
+    except ValueError:
+        return False
+    return True
 
 
 def _retry(call, waits=(1, 2, 4), sleeper=None):
@@ -492,7 +614,31 @@ def fetch_minute_partitions(
             .set_index("code")["amount"]
         )
         clean, coverage = normalize_minute_day(joined, day, amounts)
-        write_day_partition(clean, statuses, day, root)
+        covered_codes = set(coverage["code"]) if not coverage.empty else set()
+        no_data_rows = [
+            {
+                "date": day,
+                "code": code,
+                "minute_count": 0,
+                "amount_relative_error": np.nan,
+                "reason": "no_data",
+            }
+            for code, status in statuses.items()
+            if status == "no_data" and code not in covered_codes
+        ]
+        if no_data_rows:
+            coverage = pd.concat(
+                [coverage, pd.DataFrame(no_data_rows)],
+                ignore_index=True,
+            )
+        coverage = _normalize_day_coverage(coverage, statuses, day)
+        write_day_partition(
+            clean,
+            statuses,
+            day,
+            root,
+            coverage=coverage,
+        )
         if not coverage.empty:
             coverage_frames.append(coverage)
 

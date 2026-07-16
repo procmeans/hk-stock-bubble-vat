@@ -537,8 +537,14 @@ def _read_manifest(day, root, candidates: list[str]) -> dict[str, str]:
     return payload["statuses"]
 
 
-def _read_minute_partition(day, root, candidates: list[str]) -> tuple[pd.DataFrame, dict]:
+def _read_minute_partition(day, root, candidates: list[str]):
     statuses = _read_manifest(day, root, candidates)
+    daily_coverage = data.read_day_coverage(
+        day,
+        candidates,
+        root,
+        statuses=statuses,
+    )
     parquet_path, _ = data._day_paths(day, root)
     try:
         frame = pd.read_parquet(parquet_path)
@@ -553,7 +559,7 @@ def _read_minute_partition(day, root, candidates: list[str]) -> tuple[pd.DataFra
             + ", ".join(missing)
         )
     if frame.empty:
-        return frame, statuses
+        return frame, statuses, daily_coverage
     try:
         normalized_codes = data._normalize_code_series(
             frame["code"],
@@ -576,7 +582,7 @@ def _read_minute_partition(day, root, candidates: list[str]) -> tuple[pd.DataFra
         values = pd.to_numeric(frame[column], errors="coerce")
         if not np.isfinite(values).all():
             raise ValueError(f"minute partition contains invalid {column}")
-    return frame, statuses
+    return frame, statuses, daily_coverage
 
 
 def _normalize_coverage(frame: pd.DataFrame, context: str) -> pd.DataFrame:
@@ -607,7 +613,7 @@ def _normalize_coverage(frame: pd.DataFrame, context: str) -> pd.DataFrame:
     }
     if not result["reason"].isin(allowed).all():
         raise ValueError(f"{context} contains invalid reason")
-    return result
+    return result.astype(data.COVERAGE_DTYPES)
 
 
 def _existing_coverage(path: Path) -> pd.DataFrame:
@@ -709,46 +715,50 @@ def _complete_coverage(
     delta: pd.DataFrame,
 ) -> pd.DataFrame:
     pieces = [frame for frame in (previous, delta) if not frame.empty]
-    combined = (
+    operational = (
         pd.concat(pieces, ignore_index=True)
         if pieces
         else pd.DataFrame(columns=data.COVERAGE_COLUMNS)
     )
-    if not combined.empty:
-        combined = combined.drop_duplicates(["date", "code"], keep="last")
-        combined = _normalize_coverage(combined, "merged coverage")
-    rows = []
-    day_partitions = {}
-    combined_keys = set(
-        combined[["date", "code"]].itertuples(index=False, name=None)
-    )
+    if not operational.empty:
+        operational = operational.drop_duplicates(
+            ["date", "code"],
+            keep="last",
+        )
+        operational = _normalize_coverage(
+            operational,
+            "merged coverage",
+        )
+    daily_frames = []
     expected_keys = set()
     for day in plan["fetch_dates"]:
-        frame, statuses = _read_minute_partition(
+        frame, statuses, daily_coverage = _read_minute_partition(
             day,
             root,
             plan["candidates"],
         )
-        day_partitions[day] = (frame, statuses)
-        for code, status in statuses.items():
-            key = (day, code)
-            expected_keys.add(key)
-            if status == "no_data" and key not in combined_keys:
-                rows.append(
-                    {
-                        "date": day,
-                        "code": code,
-                        "minute_count": 0,
-                        "amount_relative_error": np.nan,
-                        "reason": "no_data",
-                    }
-                )
-            elif status == "returned" and key not in combined_keys:
-                raise ValueError(
-                    f"coverage missing returned code {code} on {day.date()}"
-                )
-    if rows:
-        combined = pd.concat([combined, pd.DataFrame(rows)], ignore_index=True)
+        daily_coverage = _normalize_coverage(
+            daily_coverage,
+            "daily coverage sidecar",
+        )
+        daily_frames.append(daily_coverage)
+        expected_keys.update(
+            daily_coverage[["date", "code"]].itertuples(
+                index=False,
+                name=None,
+            )
+        )
+        _validate_day_minute_coverage(
+            day,
+            frame,
+            statuses,
+            daily_coverage.set_index(["date", "code"]),
+        )
+    authoritative = pd.concat(daily_frames, ignore_index=True)
+    combined = pd.concat(
+        [operational, authoritative],
+        ignore_index=True,
+    ).drop_duplicates(["date", "code"], keep="last")
     combined = combined.loc[
         combined[["date", "code"]]
         .apply(tuple, axis=1)
@@ -760,14 +770,6 @@ def _complete_coverage(
     )
     if actual_keys != expected_keys:
         raise ValueError("coverage does not exactly cover the prepared plan")
-    indexed = combined.set_index(["date", "code"])
-    for day, (frame, statuses) in day_partitions.items():
-        _validate_day_minute_coverage(
-            day,
-            frame,
-            statuses,
-            indexed,
-        )
     return combined
 
 
@@ -913,20 +915,38 @@ def _validate_coverage_and_partitions(
     )
     if actual != expected:
         raise ValueError("coverage does not exactly cover the prepared plan")
-    indexed = coverage.set_index(["date", "code"])
     partitions = []
+    daily_frames = []
     for day in plan["fetch_dates"]:
-        frame, statuses = _read_minute_partition(
+        frame, statuses, daily_coverage = _read_minute_partition(
             day,
             root,
             plan["candidates"],
         )
         partitions.append((day, frame))
+        daily_coverage = _normalize_coverage(
+            daily_coverage,
+            "daily coverage sidecar",
+        )
+        daily_frames.append(daily_coverage)
         _validate_day_minute_coverage(
             day,
             frame,
             statuses,
-            indexed,
+            daily_coverage.set_index(["date", "code"]),
+        )
+    authoritative = pd.concat(daily_frames, ignore_index=True)
+    authoritative = _normalize_coverage(
+        authoritative,
+        "daily coverage sidecars",
+    )
+    normalized_global = _normalize_coverage(
+        coverage,
+        "global coverage",
+    )
+    if not normalized_global.equals(authoritative):
+        raise ValueError(
+            "minute coverage global file does not match daily coverage sidecars"
         )
     return partitions
 
