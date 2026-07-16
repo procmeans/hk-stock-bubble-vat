@@ -8,14 +8,29 @@ import numpy as np
 import pandas as pd
 
 
-MINUTE_COLUMNS = ["code", "time", "close", "volume", "amount"]
-COVERAGE_COLUMNS = [
-    "date",
-    "code",
-    "minute_count",
-    "amount_relative_error",
-    "reason",
-]
+MINUTE_DTYPES = {
+    "code": "string",
+    "time": "datetime64[ns]",
+    "close": "float64",
+    "volume": "float64",
+    "amount": "float64",
+}
+COVERAGE_DTYPES = {
+    "date": "datetime64[ns]",
+    "code": "string",
+    "minute_count": "int64",
+    "amount_relative_error": "float64",
+    "reason": "string",
+}
+MINUTE_COLUMNS = list(MINUTE_DTYPES)
+COVERAGE_COLUMNS = list(COVERAGE_DTYPES)
+
+
+def _empty_typed_frame(dtypes) -> pd.DataFrame:
+    return pd.DataFrame({
+        column: pd.Series(dtype=dtype)
+        for column, dtype in dtypes.items()
+    })
 
 
 def load_daily_raw(path: Path) -> pd.DataFrame:
@@ -109,15 +124,21 @@ def normalize_minute_day(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Clean one raw minute day and record per-code quality decisions."""
     if frame.empty:
-        return pd.DataFrame(columns=MINUTE_COLUMNS), pd.DataFrame(
-            columns=COVERAGE_COLUMNS
+        return (
+            _empty_typed_frame(MINUTE_DTYPES),
+            _empty_typed_frame(COVERAGE_DTYPES),
         )
 
     data = frame.copy()
-    data["code"] = data["thscode"].astype(str).str.slice(0, 6).str.zfill(6)
+    data["code"] = (
+        data["thscode"].astype(str).str.slice(0, 6).str.zfill(6).astype("string")
+    )
     data["time"] = pd.to_datetime(data["time"], errors="coerce")
     for column in ["close", "volume", "amount"]:
-        data[column] = pd.to_numeric(data[column], errors="coerce")
+        data[column] = pd.to_numeric(data[column], errors="coerce").astype(
+            "float64"
+        )
+    raw_codes = sorted(data["code"].unique())
 
     data = data.drop_duplicates(["code", "time"], keep="last")
     valid_day = data["time"].dt.normalize().eq(pd.Timestamp(day).normalize())
@@ -132,7 +153,8 @@ def normalize_minute_day(
         )
     )
     valid_values = (
-        data["close"].gt(0)
+        np.isfinite(data[["close", "volume", "amount"]]).all(axis=1)
+        & data["close"].gt(0)
         & data["volume"].ge(0)
         & data["amount"].ge(0)
     )
@@ -143,11 +165,17 @@ def normalize_minute_day(
 
     kept = []
     coverage_rows = []
-    for code, group in data.groupby("code", sort=True):
-        expected = float(daily_amount.get(code, np.nan))
+    groups = dict(tuple(data.groupby("code", sort=True)))
+    empty_group = data.iloc[0:0]
+    for code in raw_codes:
+        group = groups.get(code, empty_group)
+        try:
+            expected = float(daily_amount.get(code, np.nan))
+        except (TypeError, ValueError):
+            expected = np.nan
         relative_error = (
             abs(group["amount"].sum() - expected) / expected
-            if expected > 0
+            if np.isfinite(expected) and expected > 0
             else np.inf
         )
         reason = "ok"
@@ -173,7 +201,10 @@ def normalize_minute_day(
         if kept
         else data.iloc[0:0].copy()
     )
-    coverage = pd.DataFrame(coverage_rows, columns=COVERAGE_COLUMNS)
+    coverage = pd.DataFrame(
+        coverage_rows,
+        columns=COVERAGE_COLUMNS,
+    ).astype(COVERAGE_DTYPES)
     return clean, coverage
 
 
@@ -194,6 +225,7 @@ def write_day_partition(
     parquet.parent.mkdir(parents=True, exist_ok=True)
     temp_parquet = parquet.with_suffix(".parquet.tmp")
     temp_manifest = manifest.with_suffix(".json.tmp")
+    previous_manifest = manifest.with_suffix(".json.previous")
 
     frame.to_parquet(temp_parquet, index=False)
     temp_manifest.write_text(
@@ -207,8 +239,14 @@ def write_day_partition(
         ),
         encoding="utf-8",
     )
+    if manifest.exists():
+        manifest.replace(previous_manifest)
     temp_parquet.replace(parquet)
     temp_manifest.replace(manifest)
+    try:
+        previous_manifest.unlink()
+    except FileNotFoundError:
+        pass
     return parquet, manifest
 
 
@@ -223,10 +261,25 @@ def day_complete(day, codes, root) -> bool:
         return False
     if not isinstance(payload, dict):
         return False
-    statuses = payload.get("statuses", {})
+    expected_date = pd.Timestamp(day).strftime("%Y-%m-%d")
+    if payload.get("date") != expected_date or "statuses" not in payload:
+        return False
+    statuses = payload["statuses"]
     if not isinstance(statuses, dict):
         return False
-    return set(statuses) == set(codes) and set(statuses.values()) <= {
-        "returned",
-        "no_data",
-    }
+    if not all(
+        isinstance(code, str)
+        and isinstance(status, str)
+        and status in {"returned", "no_data"}
+        for code, status in statuses.items()
+    ):
+        return False
+    if isinstance(codes, (str, bytes)):
+        return False
+    try:
+        requested_codes = list(codes)
+    except TypeError:
+        return False
+    if not all(isinstance(code, str) for code in requested_codes):
+        return False
+    return set(statuses) == set(requested_codes)

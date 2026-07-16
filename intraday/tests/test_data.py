@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import intraday.data as intraday_data
 from intraday.data import (
     day_complete,
     load_daily_raw,
@@ -300,6 +301,112 @@ def test_normalize_minute_day_returns_typed_empty_outputs():
     ]
     assert clean.empty
     assert coverage.empty
+    assert clean.dtypes.astype(str).to_dict() == {
+        "code": "string",
+        "time": "datetime64[ns]",
+        "close": "float64",
+        "volume": "float64",
+        "amount": "float64",
+    }
+    assert coverage.dtypes.astype(str).to_dict() == {
+        "date": "datetime64[ns]",
+        "code": "string",
+        "minute_count": "int64",
+        "amount_relative_error": "float64",
+        "reason": "string",
+    }
+
+
+def test_normalize_minute_day_records_code_with_zero_valid_minutes():
+    day = pd.Timestamp("2026-01-12")
+    frame = pd.DataFrame({
+        "thscode": ["000002.SZ", "000002.SZ"],
+        "time": [day + pd.Timedelta(hours=12), "not-a-time"],
+        "close": [10.0, 10.0],
+        "volume": [1.0, 1.0],
+        "amount": [5.0, 5.0],
+    })
+
+    clean, coverage = normalize_minute_day(
+        frame,
+        day,
+        pd.Series({"000002": 10.0}),
+    )
+
+    assert clean.empty
+    assert coverage[["code", "minute_count", "reason"]].to_dict("records") == [{
+        "code": "000002",
+        "minute_count": 0,
+        "reason": "too_few_minutes",
+    }]
+
+
+@pytest.mark.parametrize(
+    "daily_amount",
+    [pd.Series(dtype=float), pd.Series({"000001": 0.0})],
+    ids=["missing", "zero"],
+)
+def test_normalize_minute_day_rejects_unusable_daily_amount(daily_amount):
+    clean, coverage = normalize_minute_day(
+        _minute_frame(),
+        pd.Timestamp("2026-01-12"),
+        daily_amount,
+    )
+
+    assert clean.empty
+    assert np.isinf(coverage.loc[0, "amount_relative_error"])
+    assert coverage.loc[0, "reason"] == "amount_mismatch"
+
+
+def test_normalize_minute_day_includes_all_four_session_boundaries():
+    day = pd.Timestamp("2026-01-12")
+    boundaries = pd.DatetimeIndex([
+        day + pd.Timedelta(hours=9, minutes=30),
+        day + pd.Timedelta(hours=11, minutes=30),
+        day + pd.Timedelta(hours=13),
+        day + pd.Timedelta(hours=15),
+    ])
+    boundary_rows = pd.DataFrame({
+        "thscode": "000001.SZ",
+        "time": boundaries,
+        "close": 10.0,
+        "volume": 1.0,
+        "amount": 5.0,
+    })
+
+    clean, coverage = normalize_minute_day(
+        pd.concat([_minute_frame(count=196), boundary_rows], ignore_index=True),
+        day,
+        pd.Series({"000001": 1_000.0}),
+    )
+
+    assert len(clean) == 200
+    assert set(boundaries) <= set(clean["time"])
+    assert coverage.loc[0, "reason"] == "ok"
+
+
+def test_normalize_minute_day_rejects_non_finite_values():
+    frame = _minute_frame(count=206)
+    for position, (column, value) in enumerate([
+        ("close", np.inf),
+        ("close", -np.inf),
+        ("volume", np.inf),
+        ("volume", -np.inf),
+        ("amount", np.inf),
+        ("amount", -np.inf),
+    ]):
+        frame.loc[position, column] = value
+
+    clean, coverage = normalize_minute_day(
+        frame,
+        pd.Timestamp("2026-01-12"),
+        pd.Series({"000001": 1_000.0}),
+    )
+
+    assert len(clean) == 200
+    assert np.isfinite(clean[["close", "volume", "amount"]]).all().all()
+    assert coverage.loc[0, "minute_count"] == 200
+    assert coverage.loc[0, "reason"] == "ok"
 
 
 def test_partition_is_complete_with_explicit_no_data(monkeypatch, tmp_path):
@@ -364,6 +471,92 @@ def test_day_complete_rejects_missing_files_and_unknown_status(monkeypatch, tmp_
     assert not day_complete(day, ["000001"], tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("payload", "codes"),
+    [
+        ({"statuses": {"000001": "returned"}}, ["000001"]),
+        ({
+            "date": "2026-01-13",
+            "statuses": {"000001": "returned"},
+        }, ["000001"]),
+        ({"date": "2026-01-12"}, []),
+        ({"date": "2026-01-12", "statuses": []}, ["000001"]),
+        ({
+            "date": "2026-01-12",
+            "statuses": {"000001": ["returned"]},
+        }, ["000001"]),
+        ({
+            "date": "2026-01-12",
+            "statuses": {"000001": 1},
+        }, ["000001"]),
+    ],
+)
+def test_day_complete_rejects_invalid_manifest_structure(
+    monkeypatch,
+    tmp_path,
+    payload,
+    codes,
+):
+    day = pd.Timestamp("2026-01-12")
+
+    def write_fake_parquet(self, path, index):
+        Path(path).write_text("parquet payload")
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", write_fake_parquet)
+    _, manifest = write_day_partition(
+        pd.DataFrame({"code": ["000001"]}),
+        {"000001": "returned"},
+        day,
+        tmp_path,
+    )
+    manifest.write_text(json.dumps(payload))
+
+    assert day_complete(day, codes, tmp_path) is False
+
+
+def test_day_complete_rejects_non_string_manifest_keys(monkeypatch, tmp_path):
+    day = pd.Timestamp("2026-01-12")
+
+    def write_fake_parquet(self, path, index):
+        Path(path).write_text("parquet payload")
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", write_fake_parquet)
+    write_day_partition(
+        pd.DataFrame({"code": ["000001"]}),
+        {"000001": "returned"},
+        day,
+        tmp_path,
+    )
+    monkeypatch.setattr(
+        intraday_data.json,
+        "loads",
+        lambda payload: {
+            "date": "2026-01-12",
+            "statuses": {1: "returned"},
+        },
+    )
+
+    assert day_complete(day, ["000001"], tmp_path) is False
+
+
+@pytest.mark.parametrize("codes", [[1], [["000001"]], None])
+def test_day_complete_rejects_unsafe_requested_codes(monkeypatch, tmp_path, codes):
+    day = pd.Timestamp("2026-01-12")
+
+    def write_fake_parquet(self, path, index):
+        Path(path).write_text("parquet payload")
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", write_fake_parquet)
+    write_day_partition(
+        pd.DataFrame({"code": ["000001"]}),
+        {"000001": "returned"},
+        day,
+        tmp_path,
+    )
+
+    assert day_complete(day, codes, tmp_path) is False
+
+
 def test_partition_does_not_publish_when_staging_fails(monkeypatch, tmp_path):
     day = pd.Timestamp("2026-01-12")
 
@@ -384,3 +577,95 @@ def test_partition_does_not_publish_when_staging_fails(monkeypatch, tmp_path):
     partition_dir = tmp_path / "minute"
     assert not (partition_dir / "2026-01-12.parquet").exists()
     assert not (partition_dir / "2026-01-12.json").exists()
+
+
+@pytest.mark.parametrize("failed_stage", ["parquet", "manifest"])
+def test_existing_partition_survives_staging_failure(
+    monkeypatch,
+    tmp_path,
+    failed_stage,
+):
+    day = pd.Timestamp("2026-01-12")
+    original_write_text = Path.write_text
+
+    def write_fake_parquet(self, path, index):
+        original_write_text(Path(path), str(self.loc[self.index[0], "close"]))
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", write_fake_parquet)
+    old_frame = pd.DataFrame({"code": ["000001"], "close": [10.0]})
+    new_frame = pd.DataFrame({"code": ["000001"], "close": [20.0]})
+    statuses = {"000001": "returned"}
+    parquet, _ = write_day_partition(old_frame, statuses, day, tmp_path)
+    assert day_complete(day, ["000001"], tmp_path)
+
+    failure_pending = True
+
+    if failed_stage == "parquet":
+        def fail_staging_parquet(self, path, index):
+            nonlocal failure_pending
+            write_fake_parquet(self, path, index)
+            if failure_pending:
+                failure_pending = False
+                raise OSError("simulated parquet staging failure")
+
+        monkeypatch.setattr(pd.DataFrame, "to_parquet", fail_staging_parquet)
+    else:
+        def fail_staging_manifest(self, data, *args, **kwargs):
+            nonlocal failure_pending
+            if self.name.endswith(".json.tmp") and failure_pending:
+                failure_pending = False
+                raise OSError("simulated manifest staging failure")
+            return original_write_text(self, data, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", fail_staging_manifest)
+
+    with pytest.raises(OSError, match=f"simulated {failed_stage} staging failure"):
+        write_day_partition(new_frame, statuses, day, tmp_path)
+
+    assert day_complete(day, ["000001"], tmp_path)
+    assert parquet.read_text() == "10.0"
+
+    write_day_partition(new_frame, statuses, day, tmp_path)
+    assert day_complete(day, ["000001"], tmp_path)
+    assert parquet.read_text() == "20.0"
+
+
+@pytest.mark.parametrize("failed_suffix", [".parquet.tmp", ".json.tmp"])
+def test_existing_partition_is_invalidated_when_publish_fails_and_retry_recovers(
+    monkeypatch,
+    tmp_path,
+    failed_suffix,
+):
+    day = pd.Timestamp("2026-01-12")
+
+    def write_fake_parquet(self, path, index):
+        Path(path).write_text(str(self.loc[self.index[0], "close"]))
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", write_fake_parquet)
+    old_frame = pd.DataFrame({"code": ["000001"], "close": [10.0]})
+    new_frame = pd.DataFrame({"code": ["000001"], "close": [20.0]})
+    statuses = {"000001": "returned"}
+    parquet, manifest = write_day_partition(old_frame, statuses, day, tmp_path)
+    assert day_complete(day, ["000001"], tmp_path)
+
+    original_replace = Path.replace
+    failure_pending = True
+
+    def fail_publish_once(self, target):
+        nonlocal failure_pending
+        if self.name.endswith(failed_suffix) and failure_pending:
+            failure_pending = False
+            raise OSError(f"simulated {failed_suffix} publish failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_publish_once)
+
+    with pytest.raises(OSError, match="publish failure"):
+        write_day_partition(new_frame, statuses, day, tmp_path)
+
+    assert not manifest.exists()
+    assert not day_complete(day, ["000001"], tmp_path)
+
+    write_day_partition(new_frame, statuses, day, tmp_path)
+    assert day_complete(day, ["000001"], tmp_path)
+    assert parquet.read_text() == "20.0"
