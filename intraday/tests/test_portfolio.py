@@ -43,6 +43,26 @@ def test_one_price_limit_direction_rounding_and_unverifiable_rows():
     assert is_one_price_limit(up, np.nan) == (True, True)
 
 
+@pytest.mark.parametrize(
+    ("price", "expected"),
+    [(10.45, (True, False)), (9.55, (False, True))],
+)
+def test_one_price_limit_includes_exact_four_point_five_percent_boundary(
+    price,
+    expected,
+):
+    row = pd.Series({"open": price, "high": price, "low": price, "close": price})
+
+    assert is_one_price_limit(row, 10.0) == expected
+
+
+@pytest.mark.parametrize("price", [10.44, 9.56])
+def test_one_price_limit_below_boundary_remains_bidirectionally_blocked(price):
+    row = pd.Series({"open": price, "high": price, "low": price, "close": price})
+
+    assert is_one_price_limit(row, 10.0) == (True, True)
+
+
 @pytest.mark.parametrize("previous_close", [0.0, -1.0, None, "bad"])
 def test_one_price_limit_blocks_both_sides_for_invalid_previous_close(
     previous_close,
@@ -267,13 +287,14 @@ def test_simulate_returns_stable_empty_trade_schema():
         ("duplicate-date", "adjusted_open index must be unique"),
         ("unsorted-date", "adjusted_open index must be increasing"),
         ("duplicate-code", "adjusted_open columns must be unique"),
+        ("unsorted-code", "adjusted_open columns must be increasing"),
         ("duplicate-raw", "raw_daily index must be unique"),
         ("duplicate-target", "target index must be unique"),
     ],
 )
 def test_simulate_rejects_duplicate_or_unsorted_inputs(case, message):
     dates = pd.bdate_range("2026-01-01", periods=3)
-    opens = pd.DataFrame({"A": [10.0, 10.0, 10.0]}, index=dates)
+    opens = pd.DataFrame(10.0, index=dates, columns=["A", "B"])
     raw = _raw_ohlc(opens)
     targets = {dates[0]: pd.Series({"A": 1.0})}
     if case == "duplicate-date":
@@ -281,8 +302,9 @@ def test_simulate_rejects_duplicate_or_unsorted_inputs(case, message):
     elif case == "unsorted-date":
         opens = opens.iloc[[1, 0, 2]]
     elif case == "duplicate-code":
-        opens = pd.concat([opens, opens], axis=1)
         opens.columns = ["A", "A"]
+    elif case == "unsorted-code":
+        opens = opens[["B", "A"]]
     elif case == "duplicate-raw":
         raw = pd.concat([raw, raw.iloc[[0]]])
     else:
@@ -295,6 +317,26 @@ def test_simulate_rejects_duplicate_or_unsorted_inputs(case, message):
         simulate(targets, opens, raw, cost_bps=20)
 
 
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("unsorted", "raw_daily index must be increasing"),
+        ("reversed-levels", "raw_daily index levels must be date,code"),
+    ],
+)
+def test_simulate_rejects_unsorted_or_reversed_raw_multiindex(case, message):
+    dates = pd.bdate_range("2026-01-01", periods=3)
+    opens = pd.DataFrame(10.0, index=dates, columns=["A", "B"])
+    raw = _raw_ohlc(opens)
+    if case == "unsorted":
+        raw = raw.iloc[::-1]
+    else:
+        raw = raw.reorder_levels(["code", "date"]).sort_index()
+
+    with pytest.raises(ValueError, match=message):
+        simulate({}, opens, raw, cost_bps=20)
+
+
 @pytest.mark.parametrize("cost_bps", [-1.0, np.nan, np.inf])
 def test_simulate_rejects_invalid_cost(cost_bps):
     dates = pd.bdate_range("2026-01-01", periods=2)
@@ -302,6 +344,33 @@ def test_simulate_rejects_invalid_cost(cost_bps):
 
     with pytest.raises(ValueError, match="cost_bps must be finite and nonnegative"):
         simulate({}, opens, _raw_ohlc(opens), cost_bps=cost_bps)
+
+
+def test_simulate_executes_from_the_same_normalized_numeric_target_copy():
+    dates = pd.bdate_range("2026-01-01", periods=3)
+    opens = pd.DataFrame({"A": [10.0, 10.0, 10.0]}, index=dates)
+    targets = {dates[0]: pd.Series({"A": "1.0"})}
+
+    result = simulate(targets, opens, _raw_ohlc(opens), cost_bps=0)
+
+    assert result["trades"][["code", "side"]].to_dict("records") == [
+        {"code": "A", "side": "buy"}
+    ]
+    assert result["trades"].loc[0, "notional"] == 1.0
+
+
+@pytest.mark.parametrize("weight", ["not-a-number", np.inf, -0.1])
+def test_simulate_rejects_invalid_target_weights(weight):
+    dates = pd.bdate_range("2026-01-01", periods=2)
+    opens = pd.DataFrame({"A": [10.0, 10.0]}, index=dates)
+
+    with pytest.raises(ValueError, match="target weights must be finite and nonnegative"):
+        simulate(
+            {dates[0]: pd.Series({"A": weight})},
+            opens,
+            _raw_ohlc(opens),
+            cost_bps=0,
+        )
 
 
 def test_build_targets_anchors_first_live_pool_day_and_keeps_five_day_cadence():

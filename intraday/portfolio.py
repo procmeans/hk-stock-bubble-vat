@@ -133,7 +133,7 @@ def _validate_simulation_inputs(
     adjusted_open,
     raw_daily,
     cost_bps,
-) -> float:
+) -> tuple[float, dict]:
     try:
         cost_value = float(cost_bps)
     except (TypeError, ValueError) as exc:
@@ -146,16 +146,30 @@ def _validate_simulation_inputs(
         raise ValueError("adjusted_open index must be increasing")
     if not adjusted_open.columns.is_unique:
         raise ValueError("adjusted_open columns must be unique")
-    if not raw_daily.index.is_unique:
-        raise ValueError("raw_daily index must be unique")
+    if not adjusted_open.columns.is_monotonic_increasing:
+        raise ValueError("adjusted_open columns must be increasing")
     if not isinstance(raw_daily.index, pd.MultiIndex) or raw_daily.index.nlevels != 2:
         raise ValueError("raw_daily index must be date/code MultiIndex")
+    if not raw_daily.index.is_unique:
+        raise ValueError("raw_daily index must be unique")
+    if list(raw_daily.index.names) != ["date", "code"]:
+        raise ValueError("raw_daily index levels must be date,code")
+    raw_dates = pd.to_datetime(
+        raw_daily.index.get_level_values("date"),
+        errors="coerce",
+        format="mixed",
+    )
+    if raw_dates.isna().any():
+        raise ValueError("raw_daily date level contains invalid date")
+    if not raw_daily.index.is_monotonic_increasing:
+        raise ValueError("raw_daily index must be increasing")
     missing_raw = [column for column in RAW_COLUMNS if column not in raw_daily]
     if missing_raw:
         raise ValueError(
             f"raw_daily missing required columns: {', '.join(missing_raw)}"
         )
     calendar = set(adjusted_open.index)
+    normalized_targets = {}
     for signal_date, target in targets.items():
         if signal_date not in calendar:
             raise ValueError("target signal date must be in adjusted_open index")
@@ -164,7 +178,12 @@ def _validate_simulation_inputs(
         weights = pd.to_numeric(target, errors="coerce")
         if not np.isfinite(weights).all() or weights.lt(0).any():
             raise ValueError("target weights must be finite and nonnegative")
-    return cost_value
+        normalized_targets[signal_date] = pd.Series(
+            weights.to_numpy(dtype=float),
+            index=target.index,
+            dtype=float,
+        )
+    return cost_value, normalized_targets
 
 
 def is_one_price_limit(
@@ -189,10 +208,12 @@ def is_one_price_limit(
         return True, True
     if len(set(prices)) != 1:
         return False, False
-    move = prices[0] / previous_value - 1.0
-    if move >= 0.045:
+    one_price = prices[0]
+    price_scale = max(abs(one_price), abs(previous_value), 1.0)
+    tolerance = 8 * np.finfo(float).eps * price_scale
+    if one_price >= previous_value * 1.045 - tolerance:
         return True, False
-    if move <= -0.045:
+    if one_price <= previous_value * 0.955 + tolerance:
         return False, True
     return True, True
 
@@ -249,12 +270,13 @@ def simulate(
     cost_bps: float = 20,
 ) -> dict:
     """Execute signal-date targets at the next valid adjusted open."""
-    cost_value = _validate_simulation_inputs(
+    cost_value, normalized_targets = _validate_simulation_inputs(
         targets,
         adjusted_open,
         raw_daily,
         cost_bps,
     )
+    targets = normalized_targets
     cost_rate = cost_value / 1e4
     cash = 1.0
     shares = {}
