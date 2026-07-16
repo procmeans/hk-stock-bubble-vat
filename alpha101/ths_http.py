@@ -87,19 +87,52 @@ def history_quotation(
     indicators,
     startdate,
     enddate,
+    functionpara=None,
     access_token: Optional[str] = None,
     refresh_token: Optional[str] = None,
     timeout: int = 60,
 ) -> pd.DataFrame:
     """Call iFinD cmd_history_quotation and return a flat DataFrame."""
+    payload = {
+        "codes": join_if_sequence(codes),
+        "indicators": join_if_sequence(indicators),
+        "startdate": startdate,
+        "enddate": enddate,
+    }
+    if functionpara is not None:
+        payload["functionpara"] = functionpara
     data = post(
         "cmd_history_quotation",
-        {
-            "codes": join_if_sequence(codes),
-            "indicators": join_if_sequence(indicators),
-            "startdate": startdate,
-            "enddate": enddate,
-        },
+        payload,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        timeout=timeout,
+    )
+    return tables_to_dataframe(data)
+
+
+def high_frequency(
+    codes,
+    indicators,
+    starttime,
+    endtime,
+    functionpara=None,
+    access_token: Optional[str] = None,
+    refresh_token: Optional[str] = None,
+    timeout: int = 60,
+) -> pd.DataFrame:
+    """Call iFinD high_frequency and return a flat DataFrame."""
+    payload = {
+        "codes": join_if_sequence(codes),
+        "indicators": join_if_sequence(indicators),
+        "starttime": starttime,
+        "endtime": endtime,
+    }
+    if functionpara is not None:
+        payload["functionpara"] = functionpara
+    data = post(
+        "high_frequency",
+        payload,
         access_token=access_token,
         refresh_token=refresh_token,
         timeout=timeout,

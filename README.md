@@ -43,6 +43,66 @@
 
 ---
 
+## A 股分钟因子六个月验证
+
+`intraday` 包提供可复现的三阶段命令行流程。默认验证区间固定为
+`2026-01-12` 至 `2026-07-10`，日线预热披露起点为 `2025-12-11`；流动性池
+取前 500，只在至少 400 只有效股票时计算，五日调仓、持有综合得分前 50，
+单边成交成本 20 bp。测试中的小样本参数不代表研究参数。
+
+先安装研究依赖并准备同花顺 HTTP API refresh token：
+
+```bash
+pip install -r alpha101/requirements.txt
+export THS_HTTP_REFRESH_TOKEN='...'
+```
+
+先以固定的不复权口径生成日线前置缓存：
+
+```bash
+python -m alpha101.ths_history fetch --universe data/a-2026-07-07.json --start 2022-07-01 --end 2026-07-10 --cache alpha101/cache/ths_panel.pkl --batch-size 80
+```
+
+该请求显式使用 `CPS=1`（不复权）和 `Fill=Omit`。缓存必需 schema 为
+`code,date,open,high,low,close,volume,amount`；本次复现缓存含 4,873,244 行、
+5,203 个代码。输入股票池 `data/a-2026-07-07.json` 的 SHA256 为
+`abc0256b0985eca70ef4b4afb88e2cc8934bfb0a7174ed7be35fcd22443ed583`，生成的
+`alpha101/cache/ths_panel.pkl` SHA256 为
+`783f2580d90347554111ff0b91ce0df4f5ce654ad62c28b01ac7f1f75a3adc84`。
+
+按阶段运行便于在真实下载中安全续传：
+
+```bash
+python -m intraday.run prepare   # 只读日线缓存，原子写 plan 与日度股票池
+python -m intraday.run fetch     # 单次获取 access token，续传属性/后复权/分钟缓存
+python -m intraday.run validate  # 严格只读缓存，生成 CSV、Markdown 与 PNG
+```
+
+也可用 `python -m intraday.run all` 顺序执行三阶段。默认日线缓存为
+`alpha101/cache/ths_panel.pkl`，研究缓存为 `intraday/cache`，结果写到
+`output/intraday_6m`；各命令可用 `--daily-cache`、`--cache`、`--output`、
+`--start`、`--end`、`--warmup`、`--top`、`--min-count`、`--top-n`、
+`--rebalance` 和 `--cost-bps` 显式覆盖。缺失、损坏或覆盖不足的缓存会令命令
+非零退出，不会被当成已完成数据。
+
+分钟请求遇到 HTTP 504/超时时，可安全重跑
+`python -m intraday.run fetch --batch-size 100`；已完成日期会跳过，较小批次不改变
+研究 plan 或参数。
+
+分钟数据使用普通同花顺高频行情，不需要 Level2。每个交易日一个 Parquet 分区
+和一个完成 manifest；股票代码统一为六位基础代码，字段为本地时间 `time`、
+`close`、`volume`、`amount`，仅接受 09:30–11:30 与 13:00–15:00。
+请求口径固定为不复权 `CPS=no`、`Fill=Original`；质量门槛为至少 200 条分钟、
+至少 30 个正成交量分钟，且分钟成交额与日线成交额误差不超过 2%。manifest
+必须对计划中的每个 `(date, code)` 明确记录 `returned` 或 `no_data`，coverage
+同时记录质量原因。开盘回测另用 `CPS=3`、`Fill=Omit` 的后复权日线。
+
+真实六个月下载规模很大：候选并集通常超过任一日的 500 只，且每只股票每个
+交易日最多约 241 行、3 个核心数值字段。`prepare` 会先打印候选并集、预计行数
+和单元数；开始 `fetch` 前请检查 iFinD API 配额、磁盘空间与预计运行时间。
+
+---
+
 ## 自动化
 
 `GitHub Actions`(`.github/workflows/update.yml`)每天定时运行:

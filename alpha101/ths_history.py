@@ -98,6 +98,7 @@ def fetch_history(
             "open,high,low,close,volume,amount",
             start,
             end,
+            functionpara={"CPS": "1", "Fill": "Omit"},
         )
         if not frame.empty:
             frames.append(normalize_history_frame(frame))
