@@ -630,6 +630,79 @@ def test_existing_partition_survives_staging_failure(
     assert parquet.read_text() == "20.0"
 
 
+def test_existing_partition_survives_manifest_invalidation_failure(
+    monkeypatch,
+    tmp_path,
+):
+    day = pd.Timestamp("2026-01-12")
+
+    def write_fake_parquet(self, path, index):
+        Path(path).write_text(str(self.loc[self.index[0], "close"]))
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", write_fake_parquet)
+    old_frame = pd.DataFrame({"code": ["000001"], "close": [10.0]})
+    new_frame = pd.DataFrame({"code": ["000001"], "close": [20.0]})
+    statuses = {"000001": "returned"}
+    parquet, manifest = write_day_partition(old_frame, statuses, day, tmp_path)
+    previous_manifest = manifest.with_suffix(".json.previous")
+    old_parquet = parquet.read_text()
+    old_manifest = manifest.read_text()
+
+    original_replace = Path.replace
+    failure_pending = True
+
+    def fail_invalidation_once(self, target):
+        nonlocal failure_pending
+        is_invalidation = self == manifest and Path(target) == previous_manifest
+        if is_invalidation and failure_pending:
+            failure_pending = False
+            raise OSError("simulated manifest invalidation failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_invalidation_once)
+
+    with pytest.raises(OSError, match="manifest invalidation failure"):
+        write_day_partition(new_frame, statuses, day, tmp_path)
+
+    assert parquet.read_text() == old_parquet
+    assert manifest.read_text() == old_manifest
+    assert not previous_manifest.exists()
+    assert day_complete(day, ["000001"], tmp_path)
+
+    write_day_partition(new_frame, statuses, day, tmp_path)
+    assert parquet.read_text() == "20.0"
+    assert day_complete(day, ["000001"], tmp_path)
+    assert not previous_manifest.exists()
+
+
+def test_orphaned_previous_manifest_never_completes_and_retry_cleans_it(
+    monkeypatch,
+    tmp_path,
+):
+    day = pd.Timestamp("2026-01-12")
+
+    def write_fake_parquet(self, path, index):
+        Path(path).write_text(str(self.loc[self.index[0], "close"]))
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", write_fake_parquet)
+    old_frame = pd.DataFrame({"code": ["000001"], "close": [10.0]})
+    new_frame = pd.DataFrame({"code": ["000001"], "close": [20.0]})
+    statuses = {"000001": "returned"}
+    parquet, manifest = write_day_partition(old_frame, statuses, day, tmp_path)
+    previous_manifest = manifest.with_suffix(".json.previous")
+    manifest.replace(previous_manifest)
+
+    assert parquet.exists()
+    assert previous_manifest.exists()
+    assert not manifest.exists()
+    assert not day_complete(day, ["000001"], tmp_path)
+
+    write_day_partition(new_frame, statuses, day, tmp_path)
+    assert parquet.read_text() == "20.0"
+    assert day_complete(day, ["000001"], tmp_path)
+    assert not previous_manifest.exists()
+
+
 @pytest.mark.parametrize("failed_suffix", [".parquet.tmp", ".json.tmp"])
 def test_existing_partition_is_invalidated_when_publish_fails_and_retry_recovers(
     monkeypatch,
@@ -646,6 +719,7 @@ def test_existing_partition_is_invalidated_when_publish_fails_and_retry_recovers
     new_frame = pd.DataFrame({"code": ["000001"], "close": [20.0]})
     statuses = {"000001": "returned"}
     parquet, manifest = write_day_partition(old_frame, statuses, day, tmp_path)
+    previous_manifest = manifest.with_suffix(".json.previous")
     assert day_complete(day, ["000001"], tmp_path)
 
     original_replace = Path.replace
@@ -664,8 +738,10 @@ def test_existing_partition_is_invalidated_when_publish_fails_and_retry_recovers
         write_day_partition(new_frame, statuses, day, tmp_path)
 
     assert not manifest.exists()
+    assert previous_manifest.exists()
     assert not day_complete(day, ["000001"], tmp_path)
 
     write_day_partition(new_frame, statuses, day, tmp_path)
     assert day_complete(day, ["000001"], tmp_path)
     assert parquet.read_text() == "20.0"
+    assert not previous_manifest.exists()
