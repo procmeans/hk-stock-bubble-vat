@@ -376,11 +376,6 @@ def _validate_attributes(
     if actual != expected:
         raise ValueError("attributes cache does not cover every anchor/candidate")
     result["float_cap"] = pd.to_numeric(result["float_cap"], errors="coerce")
-    valid = np.isfinite(result["float_cap"]) & result["float_cap"].gt(0)
-    if not valid.all():
-        raise ValueError("attributes cache contains invalid float_cap")
-    if result[["name", "industry"]].isna().any().any():
-        raise ValueError("attributes cache contains missing name or industry")
     return result
 
 

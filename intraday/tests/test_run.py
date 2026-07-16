@@ -458,6 +458,95 @@ def _empty_minute_frame():
     )
 
 
+def test_attribute_cache_preserves_nullable_values_for_pool_filtering():
+    anchor = pd.Timestamp("2026-01-12")
+    anchors = pd.DatetimeIndex([anchor])
+    candidates = ["000001", "000002", "000003", "000004"]
+    attributes = pd.DataFrame(
+        [
+            {
+                "date": anchor,
+                "code": "000001",
+                "name": "Company One",
+                "float_cap": 1_000_000.0,
+                "industry": "Industry A",
+            },
+            {
+                "date": anchor,
+                "code": "000002",
+                "name": None,
+                "float_cap": "unavailable",
+                "industry": None,
+            },
+            {
+                "date": anchor,
+                "code": "000003",
+                "name": "Company Three",
+                "float_cap": 0.0,
+                "industry": None,
+            },
+            {
+                "date": anchor,
+                "code": "000004",
+                "name": None,
+                "float_cap": 4_000_000.0,
+                "industry": "Industry B",
+            },
+        ]
+    )
+    pool = pd.DataFrame(
+        {"date": [anchor] * len(candidates), "code": candidates}
+    )
+
+    cached = intraday_run._validate_attributes(
+        attributes,
+        anchors,
+        candidates,
+    )
+    filtered = intraday_data.apply_attribute_filters(pool, cached, anchors)
+
+    assert cached[["date", "code"]].to_dict("records") == [
+        {"date": anchor, "code": code} for code in candidates
+    ]
+    assert pd.isna(cached.loc[cached["code"].eq("000002"), "float_cap"]).all()
+    assert cached.loc[cached["code"].eq("000003"), "float_cap"].eq(0).all()
+    assert cached[["name", "industry"]].isna().any().all()
+    assert filtered["code"].tolist() == ["000001"]
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["missing_key", "duplicate_key", "bad_code", "bad_date", "missing_schema"],
+)
+def test_attribute_cache_still_rejects_structural_corruption(corruption):
+    anchor = pd.Timestamp("2026-01-12")
+    anchors = pd.DatetimeIndex([anchor])
+    candidates = ["000001", "000002"]
+    attributes = pd.DataFrame(
+        {
+            "date": [anchor, anchor],
+            "code": candidates,
+            "name": ["One", "Two"],
+            "float_cap": [1.0, np.nan],
+            "industry": ["A", None],
+        }
+    )
+    if corruption == "missing_key":
+        attributes = attributes.iloc[:1]
+    elif corruption == "duplicate_key":
+        attributes.loc[1, "code"] = "000001"
+    elif corruption == "bad_code":
+        attributes.loc[1, "code"] = "bad"
+    elif corruption == "bad_date":
+        attributes["date"] = attributes["date"].astype(object)
+        attributes.loc[1, "date"] = "bad"
+    else:
+        attributes = attributes.drop(columns="industry")
+
+    with pytest.raises(ValueError, match="attributes cache"):
+        intraday_run._validate_attributes(attributes, anchors, candidates)
+
+
 def _install_no_data_fetch_fakes(
     monkeypatch,
     plan,
