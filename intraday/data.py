@@ -1,8 +1,10 @@
 """Daily-data preparation for the dynamic intraday research universe."""
 
 import json
+import re
 import time
 from datetime import time as clock_time
+from numbers import Integral, Real
 from pathlib import Path
 
 import numpy as np
@@ -29,15 +31,101 @@ COVERAGE_DTYPES = {
 }
 MINUTE_COLUMNS = list(MINUTE_DTYPES)
 COVERAGE_COLUMNS = list(COVERAGE_DTYPES)
+_THSCODE_PATTERN = re.compile(r"^([0-9]{6})\.(SZ|SH|BJ)$")
+_BASE_CODE_PATTERN = re.compile(r"^([0-9]{6})(?:\.(SZ|SH|BJ))?$")
+
+
+def _market_suffix(code: str) -> str:
+    if code.startswith(("4", "8", "92")):
+        return "BJ"
+    if code.startswith(("6", "9")):
+        return "SH"
+    return "SZ"
+
+
+def _normalize_code(value) -> str:
+    """Return one unambiguous six-digit base code or raise ValueError."""
+    suffix = None
+    if isinstance(value, bool):
+        raise ValueError(f"invalid stock code: {value!r}")
+    if isinstance(value, Integral):
+        number = int(value)
+    elif isinstance(value, Real):
+        numeric = float(value)
+        if not np.isfinite(numeric) or not numeric.is_integer():
+            raise ValueError(f"invalid stock code: {value!r}")
+        number = int(numeric)
+    elif isinstance(value, str):
+        match = _BASE_CODE_PATTERN.fullmatch(value)
+        if match is None:
+            raise ValueError(f"invalid stock code: {value!r}")
+        code, suffix = match.groups()
+        if suffix is not None and suffix != _market_suffix(code):
+            raise ValueError(f"invalid stock code: {value!r}")
+        return code
+    else:
+        raise ValueError(f"invalid stock code: {value!r}")
+
+    if number < 0 or number > 999999:
+        raise ValueError(f"invalid stock code: {value!r}")
+    return f"{number:06d}"
 
 
 def _to_thscode(code) -> str:
-    code = str(code).zfill(6)
-    if code.startswith(("4", "8", "92")):
-        return f"{code}.BJ"
-    if code.startswith(("6", "9")):
-        return f"{code}.SH"
-    return f"{code}.SZ"
+    code = _normalize_code(code)
+    return f"{code}.{_market_suffix(code)}"
+
+
+def _normalize_thscode(value):
+    if not isinstance(value, str) or _THSCODE_PATTERN.fullmatch(value) is None:
+        return None
+    try:
+        return _normalize_code(value)
+    except ValueError:
+        return None
+
+
+def _normalize_code_series(series: pd.Series, context: str) -> pd.Series:
+    codes = []
+    for index, value in series.items():
+        try:
+            codes.append(_normalize_code(value))
+        except ValueError as exc:
+            raise ValueError(
+                f"{context} contains invalid stock code at index {index}: {value!r}"
+            ) from exc
+    return pd.Series(codes, index=series.index, dtype="string")
+
+
+def _normalize_code_list(values, context: str) -> list[str]:
+    normalized = []
+    seen = set()
+    for value in values:
+        try:
+            code = _normalize_code(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"{context} contains invalid stock code: {value!r}"
+            ) from exc
+        if code not in seen:
+            normalized.append(code)
+            seen.add(code)
+    return normalized
+
+
+def _require_columns(frame: pd.DataFrame, required, context: str) -> None:
+    missing = [column for column in required if column not in frame.columns]
+    if missing:
+        raise ValueError(f"{context} missing required columns: {', '.join(missing)}")
+
+
+def _normalize_dates(values, context: str):
+    normalized = pd.to_datetime(values, errors="coerce", format="mixed")
+    if pd.isna(normalized).any():
+        raise ValueError(f"{context} contains invalid date")
+    if isinstance(normalized, pd.Series):
+        return normalized.dt.normalize()
+    return pd.DatetimeIndex(normalized).normalize()
 
 
 def _empty_typed_frame(dtypes) -> pd.DataFrame:
@@ -65,8 +153,8 @@ def prepare_universe(
 ) -> dict:
     """Build the T-1 ADV-ranked and post-ranking eligible daily pools."""
     data = raw.copy()
-    data["code"] = data["code"].astype(str).str.zfill(6)
-    data["date"] = pd.to_datetime(data["date"]).dt.normalize()
+    data["code"] = _normalize_code_series(data["code"], "raw daily")
+    data["date"] = _normalize_dates(data["date"], "raw daily")
 
     amount = data.pivot(index="date", columns="code", values="amount").sort_index()
     volume = data.pivot(index="date", columns="code", values="volume").sort_index()
@@ -144,10 +232,22 @@ def normalize_minute_day(
         )
 
     data = frame.copy()
-    data["code"] = (
-        data["thscode"].astype(str).str.slice(0, 6).str.zfill(6).astype("string")
+    _require_columns(
+        data,
+        ["thscode", "time", "close", "volume", "amount"],
+        "minute response",
     )
-    data["time"] = pd.to_datetime(data["time"], errors="coerce")
+    response_codes = data["thscode"].map(_normalize_thscode)
+    data = data.loc[response_codes.notna()].copy()
+    if data.empty:
+        return (
+            _empty_typed_frame(MINUTE_DTYPES),
+            _empty_typed_frame(COVERAGE_DTYPES),
+        )
+    data["code"] = response_codes.loc[data.index].astype("string")
+    data["time"] = pd.to_datetime(
+        data["time"], errors="coerce", format="mixed"
+    )
     for column in ["close", "volume", "amount"]:
         data[column] = pd.to_numeric(data[column], errors="coerce").astype(
             "float64"
@@ -235,6 +335,13 @@ def write_day_partition(
     root,
 ) -> tuple[Path, Path]:
     """Stage and atomically replace one day's data and completion manifest."""
+    normalized_statuses = {}
+    for value, status in statuses.items():
+        code = _normalize_code(value)
+        if code in normalized_statuses:
+            raise ValueError(f"duplicate manifest stock code: {code}")
+        normalized_statuses[code] = status
+
     parquet, manifest = _day_paths(day, root)
     parquet.parent.mkdir(parents=True, exist_ok=True)
     temp_parquet = parquet.with_suffix(".parquet.tmp")
@@ -244,9 +351,9 @@ def write_day_partition(
     frame.to_parquet(temp_parquet, index=False)
     temp_manifest.write_text(
         json.dumps(
-            {
-                "date": pd.Timestamp(day).strftime("%Y-%m-%d"),
-                "statuses": dict(sorted(statuses.items())),
+                {
+                    "date": pd.Timestamp(day).strftime("%Y-%m-%d"),
+                    "statuses": dict(sorted(normalized_statuses.items())),
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -328,10 +435,12 @@ def fetch_minute_partitions(
     batch_size=200,
 ) -> pd.DataFrame:
     """Download, validate, and cache each unfinished minute partition."""
-    candidates = list(plan["candidates"])
+    candidates = _normalize_code_list(plan["candidates"], "plan candidates")
+    _require_columns(raw_daily, ["code", "date", "amount"], "raw_daily")
     daily = raw_daily.copy()
-    daily["code"] = daily["code"].astype(str).str.zfill(6)
-    daily["date"] = pd.to_datetime(daily["date"]).dt.normalize()
+    daily["code"] = _normalize_code_series(daily["code"], "raw_daily")
+    daily["date"] = _normalize_dates(daily["date"], "raw_daily")
+    daily["amount"] = pd.to_numeric(daily["amount"], errors="coerce")
     coverage_frames = []
 
     for value in plan["fetch_dates"]:
@@ -340,6 +449,7 @@ def fetch_minute_partitions(
             continue
 
         frames = []
+        returned = set()
         for batch in chunks(candidates, batch_size):
             thscodes = [_to_thscode(code) for code in batch]
 
@@ -361,18 +471,17 @@ def fetch_minute_partitions(
 
             frame = _retry(fetch_batch)
             if not frame.empty:
-                frames.append(frame)
+                _require_columns(frame, ["thscode"], "minute response")
+                response_codes = frame["thscode"].map(_normalize_thscode)
+                accepted = response_codes.isin(set(batch))
+                if accepted.any():
+                    frames.append(frame.loc[accepted].copy())
+                    returned.update(response_codes.loc[accepted])
 
         joined = (
             pd.concat(frames, ignore_index=True)
             if frames
             else pd.DataFrame()
-        )
-        returned = set(
-            joined.get("thscode", pd.Series(dtype="string"))
-            .astype(str)
-            .str.extract(r"(\d{6})", expand=False)
-            .dropna()
         )
         statuses = {
             code: "returned" if code in returned else "no_data"
@@ -401,7 +510,8 @@ def fetch_adjusted_daily(
 ) -> pd.DataFrame:
     """Download CPS3 adjusted open and close history in bounded batches."""
     frames = []
-    for batch in chunks(list(codes), batch_size):
+    requested = _normalize_code_list(codes, "adjusted daily codes")
+    for batch in chunks(requested, batch_size):
         thscodes = [_to_thscode(code) for code in batch]
 
         def fetch_batch(thscodes=thscodes):
@@ -417,24 +527,40 @@ def fetch_adjusted_daily(
         frame = _retry(fetch_batch)
         if frame.empty:
             continue
-        normalized = frame.copy()
-        normalized["code"] = normalized["thscode"].astype(str).str.extract(
-            r"(\d{6})", expand=False
+        _require_columns(
+            frame,
+            ["thscode", "time", "open", "close"],
+            "adjusted history",
         )
+        normalized = frame.copy()
+        normalized["code"] = normalized["thscode"].map(_normalize_thscode)
         normalized["date"] = pd.to_datetime(
-            normalized["time"], errors="coerce"
+            normalized["time"], errors="coerce", format="mixed"
         ).dt.normalize()
         for column in ["open", "close"]:
             normalized[column] = pd.to_numeric(
                 normalized[column], errors="coerce"
             )
-        frames.append(normalized[["code", "date", "open", "close"]])
+        valid_values = (
+            np.isfinite(normalized[["open", "close"]]).all(axis=1)
+            & normalized["open"].gt(0)
+            & normalized["close"].gt(0)
+        )
+        valid = (
+            normalized["code"].isin(set(batch))
+            & normalized["date"].notna()
+            & valid_values
+        )
+        if valid.any():
+            frames.append(
+                normalized.loc[valid, ["code", "date", "open", "close"]]
+            )
 
     if not frames:
         raise RuntimeError("iFinD adjusted history returned no rows")
     return (
         pd.concat(frames, ignore_index=True)
-        .drop_duplicates(["code", "date"])
+        .drop_duplicates(["code", "date"], keep="first")
         .reset_index(drop=True)
     )
 
@@ -460,27 +586,33 @@ def normalize_attributes(frame, day) -> pd.DataFrame:
     """Normalize one dated smart-picking response without look-ahead."""
     day = pd.Timestamp(day).normalize()
     stamp = day.strftime("%Y%m%d")
-    cap_column = next(
-        (
-            column
-            for column in frame.columns
-            if stamp in str(column)
-            and "市值" in str(column)
-            and "限售" in str(column)
-        ),
-        None,
+    _require_columns(
+        frame,
+        ["股票代码", "股票简称", "所属同花顺行业"],
+        "attributes",
     )
-    if cap_column is None:
-        raise ValueError(f"missing dated float cap for {stamp}")
+    cap_pattern = re.compile(
+        rf"^a股市值\(不含限售股\)\[{stamp}\]$",
+        re.IGNORECASE,
+    )
+    cap_columns = [
+        column
+        for column in frame.columns
+        if cap_pattern.fullmatch(str(column)) is not None
+    ]
+    if len(cap_columns) != 1:
+        raise ValueError(
+            f"expected exactly one dated A-share float cap for {stamp}; "
+            f"found {len(cap_columns)}"
+        )
+    cap_column = cap_columns[0]
 
     result = pd.DataFrame({
         "date": day,
-        "code": frame["股票代码"].astype(str).str.extract(
-            r"(\d{6})", expand=False
-        ),
-        "name": frame["股票简称"].astype(str),
+        "code": _normalize_code_series(frame["股票代码"], "attributes"),
+        "name": frame["股票简称"].astype("string"),
         "float_cap": pd.to_numeric(frame[cap_column], errors="coerce"),
-        "industry": frame["所属同花顺行业"].astype(str),
+        "industry": frame["所属同花顺行业"].astype("string"),
     })
     return (
         result.dropna(subset=["code"])
@@ -491,7 +623,9 @@ def normalize_attributes(frame, day) -> pd.DataFrame:
 
 def fetch_attributes(anchor_dates, access_token) -> pd.DataFrame:
     """Fetch each unique point-in-time attribute anchor once."""
-    anchors = sorted({pd.Timestamp(day).normalize() for day in anchor_dates})
+    anchors = sorted(
+        set(_normalize_dates(pd.Index(anchor_dates), "attribute anchors"))
+    )
     frames = []
     for day in anchors:
 
@@ -518,13 +652,25 @@ def apply_attribute_filters(
     if eligible_pool.empty or attributes.empty:
         return eligible_pool.iloc[0:0].copy()
 
+    _require_columns(eligible_pool, ["date", "code"], "eligible_pool")
+    _require_columns(
+        attributes,
+        ["date", "code", "name", "float_cap"],
+        "attributes",
+    )
     pool = eligible_pool.copy()
-    pool["date"] = pd.to_datetime(pool["date"]).dt.normalize()
+    pool["date"] = _normalize_dates(pool["date"], "eligible_pool")
+    pool["code"] = _normalize_code_series(pool["code"], "eligible_pool")
     attrs = attributes.copy()
-    attrs["date"] = pd.to_datetime(attrs["date"]).dt.normalize()
+    attrs["date"] = _normalize_dates(attrs["date"], "attributes")
+    attrs["code"] = _normalize_code_series(attrs["code"], "attributes")
     attrs["float_cap"] = pd.to_numeric(attrs["float_cap"], errors="coerce")
 
-    eval_index = pd.DatetimeIndex(eval_dates).normalize().drop_duplicates()
+    eval_index = (
+        _normalize_dates(pd.Index(eval_dates), "eval_dates")
+        .drop_duplicates()
+        .sort_values()
+    )
     date_positions = {day: position for position, day in enumerate(eval_index)}
     anchors = pd.DatetimeIndex(attrs["date"].dropna().unique()).sort_values()
     rows = []
@@ -545,7 +691,9 @@ def apply_attribute_filters(
             .drop_duplicates("code", keep="first")
         )
         names = dated["name"].astype("string").str.strip()
-        valid_name = ~names.str.match(r"^\*?ST", case=False, na=False)
+        valid_name = names.notna() & ~names.fillna("").str.match(
+            r"^\*?ST", case=False
+        )
         valid_cap = np.isfinite(dated["float_cap"]) & dated["float_cap"].gt(0)
         allowed = set(dated.loc[valid_name & valid_cap, "code"])
         rows.append(members[members["code"].isin(allowed)])

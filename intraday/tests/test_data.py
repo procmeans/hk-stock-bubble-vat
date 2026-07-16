@@ -828,11 +828,11 @@ def test_fetch_minute_batches_codes_with_market_suffixes_and_exact_parameters(
 ):
     day = pd.Timestamp("2026-01-12")
     plan = {
-        "candidates": ["000001", "600000", "430001", "920001"],
+        "candidates": [1, 600000.0, "430001.BJ", "920001"],
         "fetch_dates": pd.DatetimeIndex([day]),
     }
     raw_daily = pd.DataFrame({
-        "code": plan["candidates"],
+        "code": ["000001.SZ", 600000, 430001.0, "920001.BJ"],
         "date": day,
         "amount": 1_000.0,
     })
@@ -869,7 +869,9 @@ def test_fetch_minute_batches_codes_with_market_suffixes_and_exact_parameters(
         "access_token": "token",
     } for call in calls)
     assert result.empty
-    assert day_complete(day, plan["candidates"], tmp_path)
+    assert day_complete(
+        day, ["000001", "600000", "430001", "920001"], tmp_path
+    )
 
 
 def test_fetch_minute_records_partial_statuses_and_reconciles_cps1_amount(
@@ -1005,7 +1007,7 @@ def test_fetch_adjusted_daily_uses_cps3_batches_and_normalizes(monkeypatch):
     monkeypatch.setattr(intraday_data.ths_http, "history_quotation", fake_history)
 
     result = intraday_data.fetch_adjusted_daily(
-        ["000001", "600000", "430001", "920001"],
+        [1, 600000.0, "430001.BJ", "920001"],
         "2026-01-01",
         "2026-01-31",
         "token",
@@ -1089,11 +1091,13 @@ def test_build_attribute_query_binds_requested_date():
 
 def test_normalize_attributes_finds_only_matching_dated_float_cap():
     raw = pd.DataFrame({
-        "股票代码": ["000001.SZ", "000001.SZ", "not-a-code"],
-        "股票简称": ["平安银行", "重复记录", "无代码"],
-        "a股市值(不含限售股)[20260109]": [9.9e10, 9.8e10, 1.0],
-        "a股市值(不含限售股)[20260112]": [1.2e11, 1.1e11, 2.0],
-        "所属同花顺行业": ["银行-股份制银行", "银行", "未知"],
+        "股票代码": ["000001.SZ", 1.0],
+        "股票简称": ["平安银行", "重复记录"],
+        "a股市值(不含限售股)[20260109]": [9.9e10, 9.8e10],
+        "总市值(不含限售股)[20260112]": [8.8e11, 8.7e11],
+        "A股市值(含限售股)[20260112]": [7.7e11, 7.6e11],
+        "a股市值(不含限售股)[20260112]": [1.2e11, 1.1e11],
+        "所属同花顺行业": ["银行-股份制银行", "银行"],
     })
 
     result = intraday_data.normalize_attributes(raw, pd.Timestamp("2026-01-12"))
@@ -1118,7 +1122,10 @@ def test_normalize_attributes_requires_matching_dated_float_cap():
         "所属同花顺行业": ["银行"],
     })
 
-    with pytest.raises(ValueError, match="missing dated float cap for 20260112"):
+    with pytest.raises(
+        ValueError,
+        match="expected exactly one dated A-share float cap for 20260112; found 0",
+    ):
         intraday_data.normalize_attributes(raw, "2026-01-12")
 
 
@@ -1216,3 +1223,369 @@ def test_apply_attribute_filters_allows_four_eval_day_lag_not_five():
 
     assert result["date"].tolist() == eval_dates[:5].tolist()
     assert result["code"].tolist() == ["000001"] * 5
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (1, "000001"),
+        (np.int64(600000), "600000"),
+        (1.0, "000001"),
+        (np.float64(920001.0), "920001"),
+        ("000001", "000001"),
+        ("000001.SZ", "000001"),
+        ("600000.SH", "600000"),
+        ("430001.BJ", "430001"),
+        ("920001.BJ", "920001"),
+    ],
+)
+def test_normalize_code_accepts_only_supported_base_representations(
+    value,
+    expected,
+):
+    assert intraday_data._normalize_code(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        np.nan,
+        np.inf,
+        1.5,
+        True,
+        None,
+        "1",
+        "00001",
+        "foo000001",
+        "０００００１",
+        "000001.sz",
+        "000001.SH",
+        "600000.SZ",
+        "920001.SH",
+    ],
+)
+def test_normalize_code_rejects_ambiguous_or_mismatched_values(value):
+    with pytest.raises(ValueError, match="invalid stock code"):
+        intraday_data._normalize_code(value)
+
+
+def test_prepare_universe_rejects_malformed_string_code():
+    day = pd.Timestamp("2026-01-12")
+    raw = pd.DataFrame([_daily_row("1", day, 1_000.0)])
+
+    with pytest.raises(ValueError, match="raw daily contains invalid stock code"):
+        prepare_universe(raw, day, day, adv_window=1, min_age=0)
+
+
+def test_write_partition_normalizes_manifest_code_keys(monkeypatch, tmp_path):
+    day = pd.Timestamp("2026-01-12")
+    monkeypatch.setattr(
+        pd.DataFrame,
+        "to_parquet",
+        lambda self, path, index: Path(path).write_text("empty"),
+    )
+
+    _, manifest = write_day_partition(
+        pd.DataFrame(),
+        {1: "returned", "600000.SH": "no_data"},
+        day,
+        tmp_path,
+    )
+
+    assert json.loads(manifest.read_text())["statuses"] == {
+        "000001": "returned",
+        "600000": "no_data",
+    }
+
+
+def test_fetch_minute_rejects_malformed_wrong_market_and_unrequested_rows(
+    monkeypatch,
+    tmp_path,
+):
+    day = pd.Timestamp("2026-01-12")
+    valid = _minute_frame(count=200, amount=5.0)
+    malformed = valid.assign(thscode="foo000001.SZ")
+    wrong_market = valid.assign(thscode="000002.SH")
+    unrequested = valid.assign(thscode="000003.SZ")
+    response = pd.concat(
+        [valid, malformed, wrong_market, unrequested], ignore_index=True
+    )
+    written = []
+    monkeypatch.setattr(
+        intraday_data.ths_http,
+        "high_frequency",
+        lambda *args, **kwargs: response,
+    )
+    monkeypatch.setattr(
+        intraday_data,
+        "write_day_partition",
+        lambda frame, statuses, candidate_day, root: written.append(
+            (frame.copy(), statuses.copy())
+        ),
+    )
+
+    coverage = intraday_data.fetch_minute_partitions(
+        {"candidates": [1, 2.0], "fetch_dates": pd.DatetimeIndex([day])},
+        pd.DataFrame({
+            "code": ["000001.SZ", 2],
+            "date": [day, day],
+            "amount": [1_000.0, 1_000.0],
+        }),
+        tmp_path,
+        "token",
+    )
+
+    clean, statuses = written[0]
+    assert statuses == {"000001": "returned", "000002": "no_data"}
+    assert clean["code"].unique().tolist() == ["000001"]
+    assert coverage["code"].tolist() == ["000001"]
+
+
+@pytest.mark.parametrize("missing", ["code", "date", "amount"])
+def test_fetch_minute_validates_raw_daily_schema(monkeypatch, tmp_path, missing):
+    day = pd.Timestamp("2026-01-12")
+    raw = pd.DataFrame({
+        "code": ["000001"],
+        "date": [day],
+        "amount": [1_000.0],
+    }).drop(columns=missing)
+    monkeypatch.setattr(
+        intraday_data.ths_http,
+        "high_frequency",
+        lambda *args, **kwargs: pytest.fail("network must not be called"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"raw_daily missing required columns: {missing}",
+    ):
+        intraday_data.fetch_minute_partitions(
+            {"candidates": [], "fetch_dates": pd.DatetimeIndex([day])},
+            raw,
+            tmp_path,
+            "token",
+        )
+
+
+@pytest.mark.parametrize("daily_amount", [np.nan, 0.0], ids=["missing", "zero"])
+def test_fetch_minute_keeps_unusable_daily_amount_as_mismatch(
+    monkeypatch,
+    tmp_path,
+    daily_amount,
+):
+    day = pd.Timestamp("2026-01-12")
+    written = []
+    monkeypatch.setattr(
+        intraday_data.ths_http,
+        "high_frequency",
+        lambda *args, **kwargs: _minute_frame(count=200, amount=5.0),
+    )
+    monkeypatch.setattr(
+        intraday_data,
+        "write_day_partition",
+        lambda frame, statuses, candidate_day, root: written.append(
+            (frame.copy(), statuses.copy())
+        ),
+    )
+
+    coverage = intraday_data.fetch_minute_partitions(
+        {
+            "candidates": ["000001.SZ"],
+            "fetch_dates": pd.DatetimeIndex([day]),
+        },
+        pd.DataFrame({
+            "code": [1.0],
+            "date": ["2026-01-12 12:34:56"],
+            "amount": [daily_amount],
+        }),
+        tmp_path,
+        "token",
+    )
+
+    assert written[0][0].empty
+    assert written[0][1] == {"000001": "returned"}
+    assert coverage[["code", "reason"]].to_dict("records") == [
+        {"code": "000001", "reason": "amount_mismatch"}
+    ]
+
+
+@pytest.mark.parametrize("missing", ["thscode", "time", "open", "close"])
+def test_fetch_adjusted_daily_validates_response_schema(monkeypatch, missing):
+    response = pd.DataFrame({
+        "thscode": ["000001.SZ"],
+        "time": ["2026-01-12"],
+        "open": [10.0],
+        "close": [11.0],
+    }).drop(columns=missing)
+    monkeypatch.setattr(
+        intraday_data.ths_http,
+        "history_quotation",
+        lambda *args, **kwargs: response,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"adjusted history missing required columns: {missing}",
+    ):
+        intraday_data.fetch_adjusted_daily(
+            ["000001"], "2026-01-01", "2026-01-31", "token"
+        )
+
+
+def test_fetch_adjusted_daily_filters_invalid_and_unrequested_rows(monkeypatch):
+    thscodes = [
+        "000001.SZ",
+        "000001.SZ",
+        "000002.SZ",
+        "foo000001.SZ",
+        "000001.SH",
+        *(["000001.SZ"] * 9),
+    ]
+    times = ["2026-01-12"] * len(thscodes)
+    times[5] = "not-a-date"
+    opens = [
+        10.0, 99.0, 20.0, 10.0, 10.0, 10.0, np.nan,
+        np.inf, 0.0, -1.0, 10.0, 10.0, 10.0, 10.0,
+    ]
+    closes = [11.0] * len(thscodes)
+    closes[10:] = [np.nan, np.inf, 0.0, -1.0]
+    response = pd.DataFrame({
+        "thscode": thscodes,
+        "time": times,
+        "open": opens,
+        "close": closes,
+    })
+    monkeypatch.setattr(
+        intraday_data.ths_http,
+        "history_quotation",
+        lambda *args, **kwargs: response,
+    )
+
+    result = intraday_data.fetch_adjusted_daily(
+        [1.0], "2026-01-01", "2026-01-31", "token"
+    )
+
+    assert result.to_dict("records") == [{
+        "code": "000001",
+        "date": pd.Timestamp("2026-01-12"),
+        "open": 10.0,
+        "close": 11.0,
+    }]
+
+
+def test_fetch_adjusted_daily_rejects_response_with_no_valid_rows(monkeypatch):
+    monkeypatch.setattr(
+        intraday_data.ths_http,
+        "history_quotation",
+        lambda *args, **kwargs: pd.DataFrame({
+            "thscode": ["000001.SZ", "000002.SZ"],
+            "time": ["not-a-date", "2026-01-12"],
+            "open": [10.0, 20.0],
+            "close": [11.0, 21.0],
+        }),
+    )
+
+    with pytest.raises(RuntimeError, match="adjusted history returned no rows"):
+        intraday_data.fetch_adjusted_daily(
+            ["000001.SZ"], "2026-01-01", "2026-01-31", "token"
+        )
+
+
+@pytest.mark.parametrize("missing", ["股票代码", "股票简称", "所属同花顺行业"])
+def test_normalize_attributes_validates_required_schema(missing):
+    raw = pd.DataFrame({
+        "股票代码": ["000001.SZ"],
+        "股票简称": ["平安银行"],
+        "A股市值(不含限售股)[20260112]": [1.2e11],
+        "所属同花顺行业": ["银行"],
+    }).drop(columns=missing)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"attributes missing required columns: {missing}",
+    ):
+        intraday_data.normalize_attributes(raw, "2026-01-12")
+
+
+def test_normalize_attributes_rejects_multiple_exact_float_cap_columns():
+    raw = pd.DataFrame({
+        "股票代码": ["000001.SZ"],
+        "股票简称": ["平安银行"],
+        "A股市值(不含限售股)[20260112]": [1.2e11],
+        "a股市值(不含限售股)[20260112]": [1.1e11],
+        "所属同花顺行业": ["银行"],
+    })
+
+    with pytest.raises(
+        ValueError,
+        match="expected exactly one dated A-share float cap for 20260112; found 2",
+    ):
+        intraday_data.normalize_attributes(raw, "2026-01-12")
+
+
+def test_normalize_attributes_preserves_missing_name_and_industry():
+    raw = pd.DataFrame({
+        "股票代码": [1.0],
+        "股票简称": [None],
+        "A股市值(不含限售股)[20260112]": [1.2e11],
+        "所属同花顺行业": [pd.NA],
+    })
+
+    result = intraday_data.normalize_attributes(raw, "2026-01-12")
+
+    assert result.loc[0, "code"] == "000001"
+    assert pd.isna(result.loc[0, "name"])
+    assert pd.isna(result.loc[0, "industry"])
+
+
+def test_normalize_attributes_rejects_wrong_market_suffix():
+    raw = pd.DataFrame({
+        "股票代码": ["000001.SH"],
+        "股票简称": ["错误市场"],
+        "A股市值(不含限售股)[20260112]": [1.2e11],
+        "所属同花顺行业": ["银行"],
+    })
+
+    with pytest.raises(ValueError, match="attributes contains invalid stock code"):
+        intraday_data.normalize_attributes(raw, "2026-01-12")
+
+
+def test_apply_attribute_filters_drops_unknown_name():
+    day = pd.Timestamp("2026-01-12")
+    pool = pd.DataFrame({"date": [day], "code": ["000001"]})
+    attributes = pd.DataFrame({
+        "date": [day],
+        "code": ["000001"],
+        "name": [pd.NA],
+        "float_cap": [1e11],
+        "industry": ["银行"],
+    })
+
+    result = intraday_data.apply_attribute_filters(pool, attributes, [day])
+
+    assert result.empty
+
+
+def test_apply_attribute_filters_sorts_eval_dates_and_normalizes_codes():
+    dates = pd.bdate_range("2026-01-12", periods=6)
+    pool = pd.DataFrame({
+        "date": [dates[4], dates[5]],
+        "code": ["000001.SZ", "000001.SZ"],
+    })
+    attributes = pd.DataFrame({
+        "date": [str(dates[0].date())],
+        "code": [1.0],
+        "name": ["平安银行"],
+        "float_cap": [1e11],
+        "industry": ["银行"],
+    })
+    eval_dates = [
+        dates[5], dates[1], dates[0], dates[4], dates[2], dates[3], dates[0]
+    ]
+
+    result = intraday_data.apply_attribute_filters(pool, attributes, eval_dates)
+
+    assert result[["date", "code"]].to_dict("records") == [{
+        "date": dates[4],
+        "code": "000001",
+    }]
