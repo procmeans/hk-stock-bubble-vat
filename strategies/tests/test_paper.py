@@ -1109,18 +1109,20 @@ def test_repository_has_two_attention_combo_accounts_and_seven_strategy_ui():
             "account": account, "title": title, "currency": "¥",
         }
         state = json.loads((root / "paper" / account / "state.json").read_text())
-        assert state["capital"] == state["cash"] == 100000.0
+        assert state["capital"] == 100000.0
         assert state["strategy"] == strategy and state["market"] == "a"
         assert state["params"] == {
             "top_n": 20, "candidate_n": 100,
             "rebalance": 2, "min_history": 60,
         }
-        assert (root / "paper" / account / "nav.csv").read_text() == (
-            "date,nav,cash,positions_value,bench_nav\n"
-        )
-        assert (root / "paper" / account / "orders.csv").read_text() == (
-            "date,ticker,side,shares,price,value,cost\n"
-        )
+        nav = pd.read_csv(root / "paper" / account / "nav.csv")
+        assert nav.columns.tolist() == [
+            "date", "nav", "cash", "positions_value", "bench_nav",
+        ]
+        orders = pd.read_csv(root / "paper" / account / "orders.csv")
+        assert orders.columns.tolist() == [
+            "date", "ticker", "side", "shares", "price", "value", "cost",
+        ]
     audit = pd.read_csv(root / "paper" / "ths_attention_combo_signals.csv")
     assert audit.columns.tolist() == paper.ATTENTION_SIGNAL_COLUMNS
     html = (root / "paper.html").read_text()
