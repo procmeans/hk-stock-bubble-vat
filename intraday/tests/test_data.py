@@ -147,3 +147,28 @@ def test_prepare_universe_includes_warmup_dates_and_estimates_three_fields():
     assert plan["candidates"] == ["000001"]
     assert plan["estimated_rows"] == len(dates) * 241
     assert plan["estimated_cells"] == len(dates) * 241 * 3
+
+
+def test_prepare_universe_returns_typed_empty_plan_outside_available_dates():
+    day = pd.Timestamp("2026-01-02")
+    raw = pd.DataFrame([_daily_row("000001", day, 100.0)])
+
+    plan = prepare_universe(raw, "2027-01-01", "2027-01-31")
+
+    assert set(plan) == {
+        "eval_dates",
+        "fetch_dates",
+        "ranked_pool",
+        "eligible_pool",
+        "candidates",
+        "estimated_rows",
+        "estimated_cells",
+    }
+    assert plan["eval_dates"].empty
+    assert plan["fetch_dates"].empty
+    assert plan["candidates"] == []
+    assert plan["estimated_rows"] == 0
+    assert plan["estimated_cells"] == 0
+    expected_columns = ["date", "code", "adv20", "liquidity_rank"]
+    assert plan["ranked_pool"].columns.tolist() == expected_columns
+    assert plan["eligible_pool"].columns.tolist() == expected_columns

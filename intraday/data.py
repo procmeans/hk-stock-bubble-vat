@@ -14,12 +14,6 @@ def load_daily_raw(path: Path) -> pd.DataFrame:
     return pd.read_pickle(path)
 
 
-def _empty_pool() -> pd.DataFrame:
-    return pd.DataFrame(
-        columns=["date", "code", "adv20", "liquidity_rank"]
-    )
-
-
 def prepare_universe(
     raw: pd.DataFrame,
     start,
@@ -46,12 +40,14 @@ def prepare_universe(
     end_day = pd.Timestamp(end).normalize()
     eval_dates = amount.loc[start_day:end_day].index
     if eval_dates.empty:
-        empty = _empty_pool()
+        empty_pool = pd.DataFrame(
+            columns=["date", "code", "adv20", "liquidity_rank"]
+        )
         return {
             "eval_dates": eval_dates,
             "fetch_dates": amount.index[:0],
-            "ranked_pool": empty,
-            "eligible_pool": empty.copy(),
+            "ranked_pool": empty_pool,
+            "eligible_pool": empty_pool.copy(),
             "candidates": [],
             "estimated_rows": 0,
             "estimated_cells": 0,
