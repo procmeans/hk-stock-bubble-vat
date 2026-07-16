@@ -535,7 +535,11 @@ def _retry(call, waits=(1, 2, 4), sleeper=None):
     for attempt in range(len(waits) + 1):
         try:
             return call()
-        except (requests.Timeout, requests.ConnectionError):
+        except (
+            requests.Timeout,
+            requests.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+        ):
             if attempt == len(waits):
                 raise
             sleeper(waits[attempt])

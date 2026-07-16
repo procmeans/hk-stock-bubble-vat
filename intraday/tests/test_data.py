@@ -908,6 +908,39 @@ def test_retry_uses_fixed_backoff_then_recovers():
     assert waits == [1, 2]
 
 
+def test_retry_recovers_after_truncated_response():
+    calls = []
+    waits = []
+    error = requests.exceptions.ChunkedEncodingError("truncated")
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise error
+        return "recovered"
+
+    assert intraday_data._retry(flaky, sleeper=waits.append) == "recovered"
+    assert len(calls) == 2
+    assert waits == [1]
+
+
+def test_retry_reraises_original_truncated_response_after_exhaustion():
+    calls = []
+    waits = []
+    error = requests.exceptions.ChunkedEncodingError("truncated")
+
+    def unavailable():
+        calls.append(1)
+        raise error
+
+    with pytest.raises(requests.exceptions.ChunkedEncodingError) as caught:
+        intraday_data._retry(unavailable, sleeper=waits.append)
+
+    assert caught.value is error
+    assert len(calls) == 4
+    assert waits == [1, 2, 4]
+
+
 @pytest.mark.parametrize(
     "error",
     [
