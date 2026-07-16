@@ -1,4 +1,5 @@
 import json
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -1039,6 +1040,78 @@ def test_fetch_adjusted_daily_uses_cps3_batches_and_normalizes(monkeypatch):
             "close": 21,
         },
     ]
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        (pd.Timestamp("2026-01-01 12:34:56"), pd.Timestamp("2026-01-31")),
+        (date(2026, 1, 1), date(2026, 1, 31)),
+        (np.datetime64("2026-01-01"), np.datetime64("2026-01-31")),
+    ],
+)
+def test_fetch_adjusted_daily_serializes_date_like_bounds_as_iso(
+    monkeypatch,
+    start,
+    end,
+):
+    calls = []
+
+    def fake_history(codes, indicators, request_start, request_end, **kwargs):
+        calls.append((request_start, request_end, kwargs["functionpara"]))
+        return pd.DataFrame(
+            {
+                "thscode": ["000001.SZ"],
+                "time": ["2026-01-12"],
+                "open": [10.0],
+                "close": [11.0],
+            }
+        )
+
+    monkeypatch.setattr(intraday_data.ths_http, "history_quotation", fake_history)
+
+    intraday_data.fetch_adjusted_daily(
+        ["000001"],
+        start,
+        end,
+        "token",
+    )
+
+    assert calls == [
+        ("2026-01-01", "2026-01-31", {"CPS": "3", "Fill": "Omit"})
+    ]
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        (pd.NaT, "2026-01-31"),
+        ("not-a-date", "2026-01-31"),
+        ("2026-01-01", None),
+        ("2026-02-01", "2026-01-31"),
+    ],
+)
+def test_fetch_adjusted_daily_rejects_invalid_date_bounds_before_network(
+    monkeypatch,
+    start,
+    end,
+):
+    calls = []
+    monkeypatch.setattr(
+        intraday_data.ths_http,
+        "history_quotation",
+        lambda *args, **kwargs: calls.append(args) or pd.DataFrame(),
+    )
+
+    with pytest.raises(ValueError, match="adjusted history date"):
+        intraday_data.fetch_adjusted_daily(
+            ["000001"],
+            start,
+            end,
+            "token",
+        )
+
+    assert calls == []
 
 
 @pytest.mark.parametrize("codes", [[], ["000001"]], ids=["empty-batch", "empty-response"])

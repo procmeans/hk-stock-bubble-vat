@@ -509,6 +509,20 @@ def fetch_adjusted_daily(
     batch_size=200,
 ) -> pd.DataFrame:
     """Download CPS3 adjusted open and close history in bounded batches."""
+    try:
+        start_day = pd.Timestamp(start)
+        end_day = pd.Timestamp(end)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("adjusted history date bounds are invalid") from exc
+    if pd.isna(start_day) or pd.isna(end_day):
+        raise ValueError("adjusted history date bounds are invalid")
+    start_day = start_day.date()
+    end_day = end_day.date()
+    if start_day > end_day:
+        raise ValueError("adjusted history date range requires start <= end")
+    request_start = start_day.strftime("%Y-%m-%d")
+    request_end = end_day.strftime("%Y-%m-%d")
+
     frames = []
     requested = _normalize_code_list(codes, "adjusted daily codes")
     for batch in chunks(requested, batch_size):
@@ -518,8 +532,8 @@ def fetch_adjusted_daily(
             return ths_http.history_quotation(
                 thscodes,
                 "open,close",
-                start,
-                end,
+                request_start,
+                request_end,
                 functionpara={"CPS": "3", "Fill": "Omit"},
                 access_token=access_token,
             )
