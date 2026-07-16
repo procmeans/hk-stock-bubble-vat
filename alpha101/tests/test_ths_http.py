@@ -4,6 +4,68 @@ import pytest
 from alpha101 import ths_http
 
 
+def test_history_quotation_includes_functionpara(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        ths_http,
+        "post",
+        lambda endpoint, payload, **kwargs: seen.update(
+            endpoint=endpoint, payload=payload
+        ) or {"tables": []},
+    )
+
+    ths_http.history_quotation(
+        ["000001.SZ"],
+        ["open", "close"],
+        "2026-01-01",
+        "2026-01-31",
+        functionpara={"CPS": "3", "Fill": "Omit"},
+        access_token="token",
+    )
+
+    assert seen == {
+        "endpoint": "cmd_history_quotation",
+        "payload": {
+            "codes": "000001.SZ",
+            "indicators": "open,close",
+            "startdate": "2026-01-01",
+            "enddate": "2026-01-31",
+            "functionpara": {"CPS": "3", "Fill": "Omit"},
+        },
+    }
+
+
+def test_high_frequency_posts_and_flattens(monkeypatch):
+    seen = {}
+
+    def fake_post(endpoint, payload, **kwargs):
+        seen.update(endpoint=endpoint, payload=payload)
+        return {
+            "tables": [{
+                "thscode": "000001.SZ",
+                "time": ["2026-01-12 09:30"],
+                "table": {
+                    "close": [10.0],
+                    "volume": [100.0],
+                    "amount": [1000.0],
+                },
+            }]
+        }
+
+    monkeypatch.setattr(ths_http, "post", fake_post)
+    result = ths_http.high_frequency(
+        ["000001.SZ"],
+        ["close", "volume", "amount"],
+        "2026-01-12 09:30:00",
+        "2026-01-12 15:00:00",
+        functionpara={"Fill": "Original", "Timeformat": "LocalTime"},
+    )
+
+    assert seen["endpoint"] == "high_frequency"
+    assert seen["payload"]["functionpara"]["Fill"] == "Original"
+    assert result.loc[0, "amount"] == 1000.0
+
+
 def test_smart_stock_picking_posts_query_and_flattens(monkeypatch):
     seen = {}
 
