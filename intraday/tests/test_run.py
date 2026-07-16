@@ -225,6 +225,64 @@ def test_prepare_writes_deterministic_atomic_validated_plan(
     assert loaded["fetch_dates"][[0, -1]].tolist() == [dates[0], dates[-1]]
     assert loaded["estimated_cells"] == loaded["estimated_rows"] * 3
     assert loaded["ranked_pool"].groupby("date").size().le(2).all()
+    assert loaded["schema_version"] == 2
+    assert (args.cache / "pool_audit.parquet").is_file()
+    assert loaded["pool_audit"]["date"].tolist() == dates[25:].tolist()
+    assert (
+        loaded["pool_audit"]["ranked_count"]
+        == loaded["pool_audit"]
+        [["age_exclusions", "suspension_exclusions", "daily_eligible_count"]]
+        .sum(axis=1)
+    ).all()
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["old_schema", "missing_column", "missing_date", "count_mismatch"],
+)
+def test_load_plan_requires_strict_versioned_pool_audit(
+    tmp_path,
+    monkeypatch,
+    corruption,
+):
+    dates = pd.bdate_range("2025-12-01", periods=25)
+    raw = _daily_frame(dates)
+    args = build_parser().parse_args(
+        [
+            "prepare",
+            "--start",
+            dates[20].strftime("%Y-%m-%d"),
+            "--end",
+            dates[-1].strftime("%Y-%m-%d"),
+            "--warmup",
+            dates[0].strftime("%Y-%m-%d"),
+            "--cache",
+            str(tmp_path),
+            "--top",
+            "2",
+        ]
+    )
+    monkeypatch.setattr("intraday.data.load_daily_raw", lambda _: raw)
+    run_prepare(args)
+
+    plan_path = tmp_path / "plan.json"
+    audit_path = tmp_path / "pool_audit.parquet"
+    if corruption == "old_schema":
+        payload = json.loads(plan_path.read_text(encoding="utf-8"))
+        payload["schema_version"] = 1
+        plan_path.write_text(json.dumps(payload), encoding="utf-8")
+    else:
+        audit = pd.read_parquet(audit_path)
+        if corruption == "missing_column":
+            audit = audit.drop(columns="age_exclusions")
+        elif corruption == "missing_date":
+            audit = audit.iloc[1:]
+        else:
+            audit.loc[audit.index[0], "daily_eligible_count"] += 1
+        audit.to_parquet(audit_path, index=False)
+
+    with pytest.raises(ValueError, match="(schema_version|pool_audit)"):
+        _load_plan(tmp_path)
 
 
 def test_prepare_fixed_default_date_boundaries_are_valid(tmp_path, monkeypatch):
@@ -555,29 +613,53 @@ def test_attribute_cache_still_rejects_structural_corruption(corruption):
         intraday_run._validate_attributes(attributes, anchors, candidates)
 
 
+def _fake_attribute_result(anchors, candidates):
+    frame = pd.DataFrame(
+        [
+            {
+                "date": day,
+                "code": code,
+                "name": f"Company {code}",
+                "float_cap": 1_000_000.0,
+                "industry": "I",
+            }
+            for day in anchors
+            for code in candidates
+        ]
+    )
+    metadata = [
+        {
+            "date": day.strftime("%Y-%m-%d"),
+            "query": intraday_data.build_attribute_query(day),
+            "columns": [
+                "股票代码",
+                "股票简称",
+                f"A股市值(不含限售股)[{day:%Y%m%d}]",
+                "所属同花顺行业",
+            ],
+            "row_count": len(candidates),
+        }
+        for day in anchors
+    ]
+    return frame, metadata
+
+
 def _install_no_data_fetch_fakes(
     monkeypatch,
     plan,
     dates,
     adjusted_calls,
+    attribute_calls=None,
 ):
     monkeypatch.setattr("alpha101.ths_http.get_access_token", lambda: "token")
-    monkeypatch.setattr(
-        "intraday.data.fetch_attributes",
-        lambda anchors, token: pd.DataFrame(
-            [
-                {
-                    "date": day,
-                    "code": code,
-                    "name": f"Company {code}",
-                    "float_cap": 1_000_000.0,
-                    "industry": "I",
-                }
-                for day in anchors
-                for code in plan["candidates"]
-            ]
-        ),
-    )
+
+    def fetch_attributes(anchors, token, *, return_metadata=False):
+        if attribute_calls is not None:
+            attribute_calls.append("called")
+        frame, metadata = _fake_attribute_result(anchors, plan["candidates"])
+        return (frame, metadata) if return_metadata else frame
+
+    monkeypatch.setattr("intraday.data.fetch_attributes", fetch_attributes)
 
     def fetch_adjusted(codes, start, end, token):
         adjusted_calls.append("called")
@@ -609,6 +691,116 @@ def _install_no_data_fetch_fakes(
 
     monkeypatch.setattr("intraday.data.fetch_adjusted_daily", fetch_adjusted)
     monkeypatch.setattr("intraday.data.fetch_minute_partitions", fetch_minutes)
+
+
+def test_fetch_reuses_attributes_only_with_matching_completion_manifest(
+    tmp_path,
+    monkeypatch,
+):
+    args, _, dates = _prepared_fetch_case(tmp_path, monkeypatch)
+    plan = _load_plan(args.cache)
+    attribute_calls = []
+    adjusted_calls = []
+    _install_no_data_fetch_fakes(
+        monkeypatch,
+        plan,
+        dates,
+        adjusted_calls,
+        attribute_calls,
+    )
+
+    run_fetch(args)
+
+    parquet_path = args.cache / "attributes.parquet"
+    manifest_path = args.cache / "attributes.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    anchors = plan["eval_dates"][:: args.rebalance]
+    assert manifest["schema_version"] == 1
+    assert manifest["request"] == {
+        "anchors": [day.strftime("%Y-%m-%d") for day in anchors],
+        "candidates": plan["candidates"],
+    }
+    assert manifest["metadata"] == _fake_attribute_result(
+        anchors,
+        plan["candidates"],
+    )[1]
+    assert manifest["frame"]["columns"] == [
+        "date", "code", "name", "float_cap", "industry"
+    ]
+    assert manifest["frame"]["row_count"] == len(anchors) * len(
+        plan["candidates"]
+    )
+    assert len(manifest["frame"]["sha256"]) == 64
+    assert attribute_calls == ["called"]
+    assert adjusted_calls == ["called"]
+
+    immutable_paths = [
+        args.cache / "adjusted_daily.parquet",
+        args.cache / "adjusted_daily.json",
+        args.cache / "data_coverage.parquet",
+        *sorted((args.cache / "minute").iterdir()),
+    ]
+    immutable = {path: path.read_bytes() for path in immutable_paths}
+
+    manifest_path.unlink()
+    run_fetch(args)
+    assert attribute_calls == ["called", "called"]
+    assert adjusted_calls == ["called"]
+    assert {path: path.read_bytes() for path in immutable_paths} == immutable
+
+    tampered_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    tampered_manifest["metadata"][0]["query"] = "tampered query"
+    manifest_path.write_text(json.dumps(tampered_manifest), encoding="utf-8")
+    run_fetch(args)
+    assert attribute_calls == ["called", "called", "called"]
+    assert adjusted_calls == ["called"]
+
+    tampered = pd.read_parquet(parquet_path)
+    tampered.loc[tampered.index[0], "float_cap"] += 1.0
+    tampered.to_parquet(parquet_path, index=False)
+    run_fetch(args)
+    assert attribute_calls == ["called", "called", "called", "called"]
+    assert adjusted_calls == ["called"]
+
+    run_fetch(args)
+    assert attribute_calls == ["called", "called", "called", "called"]
+    assert adjusted_calls == ["called"]
+
+
+def test_attributes_manifest_is_published_last_and_failure_is_not_reusable(
+    tmp_path,
+    monkeypatch,
+):
+    args, _, dates = _prepared_fetch_case(tmp_path, monkeypatch)
+    plan = _load_plan(args.cache)
+    attribute_calls = []
+    adjusted_calls = []
+    _install_no_data_fetch_fakes(
+        monkeypatch,
+        plan,
+        dates,
+        adjusted_calls,
+        attribute_calls,
+    )
+    manifest_path = args.cache / "attributes.json"
+    real_replace = Path.replace
+
+    def fail_manifest_publish(path, target):
+        if Path(target) == manifest_path:
+            raise OSError("attributes manifest publish failure")
+        return real_replace(path, target)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(Path, "replace", fail_manifest_publish)
+        with pytest.raises(OSError, match="attributes manifest publish failure"):
+            run_fetch(args)
+
+    assert (args.cache / "attributes.parquet").is_file()
+    assert not manifest_path.exists()
+    assert not list(args.cache.rglob("*.tmp"))
+    run_fetch(args)
+    assert attribute_calls == ["called", "called"]
+    assert adjusted_calls == ["called"]
 
 
 def test_fetch_reuses_adjusted_only_with_matching_completion_manifest(
@@ -711,22 +903,11 @@ def test_fetch_uses_one_token_and_atomically_resumes_complete_caches(
         token_calls.append("called")
         return "one-token"
 
-    def fetch_attributes(anchors, token):
+    def fetch_attributes(anchors, token, *, return_metadata=False):
         calls["attributes"] += 1
         assert token == "one-token"
-        return pd.DataFrame(
-            [
-                {
-                    "date": day,
-                    "code": code,
-                    "name": f"N{code}",
-                    "float_cap": 1_000_000.0,
-                    "industry": "I",
-                }
-                for day in anchors
-                for code in plan["candidates"]
-            ]
-        )
+        frame, metadata = _fake_attribute_result(anchors, plan["candidates"])
+        return (frame, metadata) if return_metadata else frame
 
     def fetch_adjusted(codes, start, end, token):
         calls["adjusted"] += 1
@@ -819,22 +1000,11 @@ def test_fetch_does_not_accept_corrupt_complete_minute_partition(
     args, _, _ = _prepared_fetch_case(tmp_path, monkeypatch)
     plan = _load_plan(args.cache)
     monkeypatch.setattr("alpha101.ths_http.get_access_token", lambda: "token")
-    monkeypatch.setattr(
-        "intraday.data.fetch_attributes",
-        lambda anchors, token: pd.DataFrame(
-            [
-                {
-                    "date": day,
-                    "code": code,
-                    "name": code,
-                    "float_cap": 1.0,
-                    "industry": "I",
-                }
-                for day in anchors
-                for code in plan["candidates"]
-            ]
-        ),
-    )
+    def fetch_attributes(anchors, token, *, return_metadata=False):
+        frame, metadata = _fake_attribute_result(anchors, plan["candidates"])
+        return (frame, metadata) if return_metadata else frame
+
+    monkeypatch.setattr("intraday.data.fetch_attributes", fetch_attributes)
     monkeypatch.setattr(
         "intraday.data.fetch_adjusted_daily",
         lambda codes, start, end, token: pd.DataFrame(
@@ -959,9 +1129,18 @@ def _write_offline_validation_case(tmp_path):
     eligible = ranked.copy()
     ranked.to_parquet(cache / "ranked_pool.parquet", index=False)
     eligible.to_parquet(cache / "eligible_pool.parquet", index=False)
+    pd.DataFrame(
+        {
+            "date": dates,
+            "ranked_count": len(codes),
+            "age_exclusions": 0,
+            "suspension_exclusions": 0,
+            "daily_eligible_count": len(codes),
+        }
+    ).to_parquet(cache / "pool_audit.parquet", index=False)
     estimated_rows = len(dates) * len(codes) * 241
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "start": dates[0].strftime("%Y-%m-%d"),
         "end": dates[-1].strftime("%Y-%m-%d"),
         "warmup": dates[0].strftime("%Y-%m-%d"),
@@ -997,6 +1176,18 @@ def _write_offline_validation_case(tmp_path):
         ]
     )
     attributes.to_parquet(cache / "attributes.parquet", index=False)
+    attribute_anchors = dates[::5]
+    attribute_metadata = _fake_attribute_result(attribute_anchors, codes)[1]
+    attribute_manifest = intraday_run._attributes_manifest_payload(
+        attributes,
+        attribute_anchors,
+        codes,
+        attribute_metadata,
+    )
+    (cache / "attributes.json").write_text(
+        json.dumps(attribute_manifest),
+        encoding="utf-8",
+    )
 
     daily_rows = []
     adjusted_rows = []
@@ -1169,6 +1360,35 @@ def test_validate_offline_end_to_end_preserves_cache_and_t_plus_one_cost(
     assert np.allclose(strategy["cost"], strategy["notional"] * 0.002)
     nav = tables["portfolio_nav.csv"]
     assert (nav["strategy_net"] < nav["strategy_gross"]).any()
+    pool_audit = tables["data_coverage.csv"].loc[
+        tables["data_coverage.csv"]["record_type"].eq("pool")
+    ]
+    assert pool_audit[
+        [
+            "ranked_count",
+            "age_exclusions",
+            "suspension_exclusions",
+            "daily_eligible_count",
+            "eligible_count",
+            "missing_or_stale_attribute_exclusions",
+            "st_exclusions",
+            "invalid_float_cap_exclusions",
+            "final_count",
+        ]
+    ].to_dict("records") == [
+        {
+            "ranked_count": 6.0,
+            "age_exclusions": 0.0,
+            "suspension_exclusions": 0.0,
+            "daily_eligible_count": 6.0,
+            "eligible_count": 6.0,
+            "missing_or_stale_attribute_exclusions": 0.0,
+            "st_exclusions": 0.0,
+            "invalid_float_cap_exclusions": 0.0,
+            "final_count": 6.0,
+        }
+        for _ in dates
+    ]
     report_text = (args.output / "report.md").read_text(encoding="utf-8")
     for phrase in [
         "固定验证区间",
@@ -1178,7 +1398,14 @@ def test_validate_offline_end_to_end_preserves_cache_and_t_plus_one_cost(
         "行业列可能不是严格时点数据",
         "六个月初步证据",
         "单边实际成交成本 20.0 bp",
-        "剔除统计",
+        "年龄 0 个股日",
+        "停牌 0 个股日",
+        "属性缺失/陈旧 0 个股日",
+        "ST 0 个股日",
+        "无效流通市值 0 个股日",
+        "分钟 ok率：150/150 = 100.00%",
+        "最终 pool/ranked 覆盖率：150/150 = 100.00%",
+        "双边总成交额换手",
         "达到" if "达到" in report_text else "未达到",
     ]:
         assert phrase in report_text
@@ -1189,6 +1416,7 @@ def test_validate_rejects_each_corrupt_cache_layer_read_only(tmp_path):
     _, manifest = intraday_data._day_paths(dates[0], args.cache)
     cases = [
         (args.cache / "attributes.parquet", b"bad attributes", "attributes cache"),
+        (args.cache / "attributes.json", b"{}", "attributes cache"),
         (
             args.cache / "adjusted_daily.parquet",
             b"bad adjusted",
@@ -1214,6 +1442,41 @@ def test_validate_rejects_each_corrupt_cache_layer_read_only(tmp_path):
             run_validate(args)
         assert path.read_bytes() == corrupt
         path.write_bytes(original)
+    assert not args.output.exists()
+
+
+@pytest.mark.parametrize("corruption", ["missing", "tampered"])
+def test_validate_requires_untampered_attributes_manifest_read_only(
+    tmp_path,
+    corruption,
+):
+    args, _, _ = _write_offline_validation_case(tmp_path)
+    manifest_path = args.cache / "attributes.json"
+    if corruption == "missing":
+        manifest_path.unlink()
+        error = FileNotFoundError
+        message = "attributes_manifest"
+    else:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload["metadata"][0]["columns"][0] = "tampered"
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        error = ValueError
+        message = "attributes cache"
+    before = {
+        path.relative_to(args.cache): path.read_bytes()
+        for path in args.cache.rglob("*")
+        if path.is_file()
+    }
+
+    with pytest.raises(error, match=message):
+        run_validate(args)
+
+    after = {
+        path.relative_to(args.cache): path.read_bytes()
+        for path in args.cache.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
     assert not args.output.exists()
 
 

@@ -29,8 +29,25 @@ COVERAGE_DTYPES = {
     "amount_relative_error": "float64",
     "reason": "string",
 }
+POOL_AUDIT_DTYPES = {
+    "date": "datetime64[ns]",
+    "ranked_count": "int64",
+    "age_exclusions": "int64",
+    "suspension_exclusions": "int64",
+    "daily_eligible_count": "int64",
+}
+ATTRIBUTE_FILTER_AUDIT_DTYPES = {
+    "date": "datetime64[ns]",
+    "eligible_count": "int64",
+    "missing_or_stale_attribute_exclusions": "int64",
+    "st_exclusions": "int64",
+    "invalid_float_cap_exclusions": "int64",
+    "final_count": "int64",
+}
 MINUTE_COLUMNS = list(MINUTE_DTYPES)
 COVERAGE_COLUMNS = list(COVERAGE_DTYPES)
+POOL_AUDIT_COLUMNS = list(POOL_AUDIT_DTYPES)
+ATTRIBUTE_FILTER_AUDIT_COLUMNS = list(ATTRIBUTE_FILTER_AUDIT_DTYPES)
 _THSCODE_PATTERN = re.compile(r"^([0-9]{6})\.(SZ|SH|BJ)$")
 _BASE_CODE_PATTERN = re.compile(r"^([0-9]{6})(?:\.(SZ|SH|BJ))?$")
 
@@ -177,6 +194,7 @@ def prepare_universe(
             "fetch_dates": amount.index[:0],
             "ranked_pool": empty_pool,
             "eligible_pool": empty_pool.copy(),
+            "pool_audit": _empty_typed_frame(POOL_AUDIT_DTYPES),
             "candidates": [],
             "estimated_rows": 0,
             "estimated_cells": 0,
@@ -184,6 +202,7 @@ def prepare_universe(
 
     ranked_rows = []
     eligible_rows = []
+    audit_rows = []
     for day in eval_dates:
         ranked = adv.loc[day].dropna().rename_axis("code").reset_index(name="adv20")
         ranked = ranked.sort_values(
@@ -196,12 +215,24 @@ def prepare_universe(
         ranked_rows.append(ranked)
 
         age_on_day = ranked["code"].map(age.loc[day]).fillna(0)
-        eligible = ranked[age_on_day.ge(min_age)]
-        volume_on_day = eligible["code"].map(volume.loc[day]).fillna(0)
-        eligible_rows.append(eligible[volume_on_day.gt(0)])
+        age_eligible = ranked[age_on_day.ge(min_age)]
+        volume_on_day = age_eligible["code"].map(volume.loc[day]).fillna(0)
+        eligible = age_eligible[volume_on_day.gt(0)]
+        eligible_rows.append(eligible)
+        audit_rows.append({
+            "date": day,
+            "ranked_count": len(ranked),
+            "age_exclusions": len(ranked) - len(age_eligible),
+            "suspension_exclusions": len(age_eligible) - len(eligible),
+            "daily_eligible_count": len(eligible),
+        })
 
     ranked_pool = pd.concat(ranked_rows, ignore_index=True)
     eligible_pool = pd.concat(eligible_rows, ignore_index=True)
+    pool_audit = pd.DataFrame(
+        audit_rows,
+        columns=POOL_AUDIT_COLUMNS,
+    ).astype(POOL_AUDIT_DTYPES)
     candidates = sorted(ranked_pool["code"].unique())
 
     first_position = amount.index.get_loc(eval_dates[0])
@@ -213,6 +244,7 @@ def prepare_universe(
         "fetch_dates": fetch_dates,
         "ranked_pool": ranked_pool,
         "eligible_pool": eligible_pool,
+        "pool_audit": pool_audit,
         "candidates": candidates,
         "estimated_rows": estimated_rows,
         "estimated_cells": estimated_rows * 3,
@@ -785,26 +817,164 @@ def normalize_attributes(frame, day) -> pd.DataFrame:
     )
 
 
-def fetch_attributes(anchor_dates, access_token) -> pd.DataFrame:
+def fetch_attributes(
+    anchor_dates,
+    access_token,
+    *,
+    return_metadata=False,
+):
     """Fetch each unique point-in-time attribute anchor once."""
     anchors = sorted(
         set(_normalize_dates(pd.Index(anchor_dates), "attribute anchors"))
     )
     frames = []
+    metadata = []
     for day in anchors:
+        query = build_attribute_query(day)
 
-        def fetch_anchor(day=day):
+        def fetch_anchor(query=query):
             return ths_http.smart_stock_picking(
-                build_attribute_query(day),
+                query,
                 access_token=access_token,
                 timeout=90,
             )
 
         raw = _retry(fetch_anchor)
+        metadata.append({
+            "date": day.strftime("%Y-%m-%d"),
+            "query": query,
+            "columns": [str(column) for column in raw.columns],
+            "row_count": len(raw),
+        })
         frames.append(normalize_attributes(raw, day))
-    if not frames:
-        return _empty_attributes()
-    return pd.concat(frames, ignore_index=True)
+    result = (
+        pd.concat(frames, ignore_index=True)
+        if frames
+        else _empty_attributes()
+    )
+    if return_metadata:
+        return result, metadata
+    return result
+
+
+def apply_attribute_filters_with_audit(
+    eligible_pool,
+    attributes,
+    eval_dates,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Apply attribute filters and audit their mutually exclusive funnel."""
+    eval_index = (
+        _normalize_dates(pd.Index(eval_dates), "eval_dates")
+        .drop_duplicates()
+        .sort_values()
+    )
+    audit_rows = []
+    if eligible_pool.empty:
+        for day in eval_index:
+            audit_rows.append({
+                "date": day,
+                "eligible_count": 0,
+                "missing_or_stale_attribute_exclusions": 0,
+                "st_exclusions": 0,
+                "invalid_float_cap_exclusions": 0,
+                "final_count": 0,
+            })
+        audit = pd.DataFrame(
+            audit_rows,
+            columns=ATTRIBUTE_FILTER_AUDIT_COLUMNS,
+        ).astype(ATTRIBUTE_FILTER_AUDIT_DTYPES)
+        return eligible_pool.iloc[0:0].copy(), audit
+
+    _require_columns(eligible_pool, ["date", "code"], "eligible_pool")
+    pool = eligible_pool.copy()
+    pool["date"] = _normalize_dates(pool["date"], "eligible_pool")
+    pool["code"] = _normalize_code_series(pool["code"], "eligible_pool")
+    if attributes.empty:
+        attrs = _empty_attributes()
+    else:
+        _require_columns(
+            attributes,
+            ["date", "code", "name", "float_cap"],
+            "attributes",
+        )
+        attrs = attributes.copy()
+        attrs["date"] = _normalize_dates(attrs["date"], "attributes")
+        attrs["code"] = _normalize_code_series(attrs["code"], "attributes")
+        attrs["float_cap"] = pd.to_numeric(attrs["float_cap"], errors="coerce")
+
+    date_positions = {day: position for position, day in enumerate(eval_index)}
+    anchors = pd.DatetimeIndex(attrs["date"].dropna().unique()).sort_values()
+    rows = []
+
+    for day in eval_index:
+        members = pool.loc[pool["date"].eq(day)]
+        eligible_count = len(members)
+        missing_count = 0
+        st_count = 0
+        invalid_cap_count = 0
+        final = pd.Series(False, index=members.index, dtype=bool)
+        if members.empty:
+            audit_rows.append({
+                "date": day,
+                "eligible_count": 0,
+                "missing_or_stale_attribute_exclusions": 0,
+                "st_exclusions": 0,
+                "invalid_float_cap_exclusions": 0,
+                "final_count": 0,
+            })
+            continue
+        prior = anchors[anchors <= day]
+        if prior.empty:
+            missing_count = eligible_count
+        else:
+            anchor = prior[-1]
+            anchor_position = eval_index.searchsorted(anchor, side="left")
+            if date_positions[day] - anchor_position > 4:
+                missing_count = eligible_count
+            else:
+                dated = (
+                    attrs.loc[attrs["date"].eq(anchor)]
+                    .drop_duplicates("code", keep="first")
+                    .set_index("code")
+                )
+                names = members["code"].map(dated["name"]).astype("string").str.strip()
+                missing = ~members["code"].isin(dated.index) | names.isna()
+                st = ~missing & names.fillna("").str.match(
+                    r"^\*?ST",
+                    case=False,
+                )
+                caps = pd.to_numeric(
+                    members["code"].map(dated["float_cap"]),
+                    errors="coerce",
+                )
+                valid_cap = np.isfinite(caps) & caps.gt(0)
+                invalid_cap = ~missing & ~st & ~valid_cap
+                final = ~missing & ~st & valid_cap
+                missing_count = int(missing.sum())
+                st_count = int(st.sum())
+                invalid_cap_count = int(invalid_cap.sum())
+                if final.any():
+                    rows.append(members.loc[final])
+
+        audit_rows.append({
+            "date": day,
+            "eligible_count": eligible_count,
+            "missing_or_stale_attribute_exclusions": missing_count,
+            "st_exclusions": st_count,
+            "invalid_float_cap_exclusions": invalid_cap_count,
+            "final_count": int(final.sum()),
+        })
+
+    filtered = (
+        pd.concat(rows, ignore_index=True)
+        if rows
+        else eligible_pool.iloc[0:0].copy()
+    )
+    audit = pd.DataFrame(
+        audit_rows,
+        columns=ATTRIBUTE_FILTER_AUDIT_COLUMNS,
+    ).astype(ATTRIBUTE_FILTER_AUDIT_DTYPES)
+    return filtered, audit
 
 
 def apply_attribute_filters(
@@ -813,55 +983,9 @@ def apply_attribute_filters(
     eval_dates,
 ) -> pd.DataFrame:
     """Apply fresh point-in-time ST and float-cap filters after ranking."""
-    if eligible_pool.empty or attributes.empty:
-        return eligible_pool.iloc[0:0].copy()
-
-    _require_columns(eligible_pool, ["date", "code"], "eligible_pool")
-    _require_columns(
+    filtered, _ = apply_attribute_filters_with_audit(
+        eligible_pool,
         attributes,
-        ["date", "code", "name", "float_cap"],
-        "attributes",
+        eval_dates,
     )
-    pool = eligible_pool.copy()
-    pool["date"] = _normalize_dates(pool["date"], "eligible_pool")
-    pool["code"] = _normalize_code_series(pool["code"], "eligible_pool")
-    attrs = attributes.copy()
-    attrs["date"] = _normalize_dates(attrs["date"], "attributes")
-    attrs["code"] = _normalize_code_series(attrs["code"], "attributes")
-    attrs["float_cap"] = pd.to_numeric(attrs["float_cap"], errors="coerce")
-
-    eval_index = (
-        _normalize_dates(pd.Index(eval_dates), "eval_dates")
-        .drop_duplicates()
-        .sort_values()
-    )
-    date_positions = {day: position for position, day in enumerate(eval_index)}
-    anchors = pd.DatetimeIndex(attrs["date"].dropna().unique()).sort_values()
-    rows = []
-
-    for day, members in pool.groupby("date", sort=True):
-        if day not in date_positions:
-            continue
-        prior = anchors[anchors <= day]
-        if prior.empty:
-            continue
-        anchor = prior[-1]
-        anchor_position = eval_index.searchsorted(anchor, side="left")
-        if date_positions[day] - anchor_position > 4:
-            continue
-
-        dated = (
-            attrs.loc[attrs["date"].eq(anchor)]
-            .drop_duplicates("code", keep="first")
-        )
-        names = dated["name"].astype("string").str.strip()
-        valid_name = names.notna() & ~names.fillna("").str.match(
-            r"^\*?ST", case=False
-        )
-        valid_cap = np.isfinite(dated["float_cap"]) & dated["float_cap"].gt(0)
-        allowed = set(dated.loc[valid_name & valid_cap, "code"])
-        rows.append(members[members["code"].isin(allowed)])
-
-    if not rows:
-        return eligible_pool.iloc[0:0].copy()
-    return pd.concat(rows, ignore_index=True)
+    return filtered

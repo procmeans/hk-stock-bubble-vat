@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -17,7 +18,8 @@ DEFAULT_WARMUP = "2025-12-11"
 DEFAULT_DAILY = Path("alpha101/cache/ths_panel.pkl")
 DEFAULT_CACHE = Path("intraday/cache")
 DEFAULT_OUTPUT = Path("output/intraday_6m")
-PLAN_SCHEMA_VERSION = 1
+PLAN_SCHEMA_VERSION = 2
+ATTRIBUTES_SCHEMA_VERSION = 1
 ADJUSTED_SCHEMA_VERSION = 1
 
 
@@ -150,6 +152,7 @@ def run_prepare(args):
         )
     ranked_pool = _sorted_pool(plan["ranked_pool"])
     eligible_pool = _sorted_pool(plan["eligible_pool"])
+    pool_audit = plan["pool_audit"].sort_values("date").reset_index(drop=True)
     if "date" not in raw:
         raise ValueError("raw daily missing required column: date")
     fetch_calendar = pd.DatetimeIndex(
@@ -183,6 +186,7 @@ def run_prepare(args):
     cache = Path(args.cache)
     _atomic_write_parquet(ranked_pool, cache / "ranked_pool.parquet")
     _atomic_write_parquet(eligible_pool, cache / "eligible_pool.parquet")
+    _atomic_write_parquet(pool_audit, cache / "pool_audit.parquet")
     _atomic_write_json(payload, cache / "plan.json")
     loaded = _load_plan(cache)
     print(f"evaluation days: {len(loaded['eval_dates'])}")
@@ -226,6 +230,62 @@ def _load_pool(path: Path, name: str) -> pd.DataFrame:
     return frame
 
 
+def _load_pool_audit(
+    path: Path,
+    eval_dates: pd.DatetimeIndex,
+    ranked_pool: pd.DataFrame,
+    eligible_pool: pd.DataFrame,
+) -> pd.DataFrame:
+    try:
+        frame = pd.read_parquet(path)
+    except Exception as exc:
+        raise ValueError(f"cannot read pool_audit: {path}") from exc
+    if list(frame.columns) != data.POOL_AUDIT_COLUMNS:
+        raise ValueError("pool_audit columns must exactly match its schema")
+    result = frame.copy()
+    try:
+        result["date"] = data._normalize_dates(result["date"], "pool_audit")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("pool_audit contains invalid date") from exc
+    if result["date"].duplicated().any():
+        raise ValueError("pool_audit contains duplicate dates")
+    result = result.sort_values("date").reset_index(drop=True)
+    if result["date"].tolist() != eval_dates.tolist():
+        raise ValueError("pool_audit does not exactly cover eval_dates")
+    count_columns = data.POOL_AUDIT_COLUMNS[1:]
+    for column in count_columns:
+        values = pd.to_numeric(result[column], errors="coerce")
+        if (
+            values.isna().any()
+            or values.lt(0).any()
+            or not np.equal(values % 1, 0).all()
+        ):
+            raise ValueError(f"pool_audit contains invalid {column}")
+        result[column] = values.astype("int64")
+    ranked_counts = (
+        ranked_pool.groupby("date", observed=True).size().reindex(eval_dates, fill_value=0)
+    )
+    eligible_counts = (
+        eligible_pool.groupby("date", observed=True).size().reindex(eval_dates, fill_value=0)
+    )
+    if not result["ranked_count"].equals(
+        ranked_counts.reset_index(drop=True).astype("int64")
+    ):
+        raise ValueError("pool_audit ranked_count does not match ranked_pool")
+    if not result["daily_eligible_count"].equals(
+        eligible_counts.reset_index(drop=True).astype("int64")
+    ):
+        raise ValueError(
+            "pool_audit daily_eligible_count does not match eligible_pool"
+        )
+    accounted = result[
+        ["age_exclusions", "suspension_exclusions", "daily_eligible_count"]
+    ].sum(axis=1)
+    if not result["ranked_count"].equals(accounted.astype("int64")):
+        raise ValueError("pool_audit exclusion counts do not reconcile")
+    return result.astype(data.POOL_AUDIT_DTYPES)
+
+
 def _load_plan(root) -> dict:
     """Load and structurally validate a complete prepared-cache plan."""
     root = Path(root)
@@ -233,6 +293,7 @@ def _load_plan(root) -> dict:
         "plan": root / "plan.json",
         "ranked_pool": root / "ranked_pool.parquet",
         "eligible_pool": root / "eligible_pool.parquet",
+        "pool_audit": root / "pool_audit.parquet",
     }
     missing = [name for name, path in required_paths.items() if not path.is_file()]
     if missing:
@@ -327,6 +388,12 @@ def _load_plan(root) -> dict:
     eligible_keys = set(map(tuple, eligible_pool[["date", "code"]].itertuples(index=False, name=None)))
     if not eligible_keys.issubset(ranked_keys):
         raise ValueError("eligible_pool must be a subset of ranked_pool")
+    pool_audit = _load_pool_audit(
+        required_paths["pool_audit"],
+        eval_dates,
+        ranked_pool,
+        eligible_pool,
+    )
 
     return {
         **payload,
@@ -339,6 +406,7 @@ def _load_plan(root) -> dict:
         "parameters": parameters,
         "ranked_pool": ranked_pool,
         "eligible_pool": eligible_pool,
+        "pool_audit": pool_audit,
     }
 
 
@@ -378,6 +446,166 @@ def _validate_attributes(
         raise ValueError("attributes cache does not cover every anchor/candidate")
     result["float_cap"] = pd.to_numeric(result["float_cap"], errors="coerce")
     return result
+
+
+def _attributes_content_hash(frame: pd.DataFrame) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"intraday-attributes-v1\n")
+    for row in frame[
+        ["date", "code", "name", "float_cap", "industry"]
+    ].itertuples(index=False, name=None):
+        day, code, name, float_cap, industry = row
+        if pd.isna(float_cap):
+            cap_value = "nan"
+        elif np.isposinf(float_cap):
+            cap_value = "inf"
+        elif np.isneginf(float_cap):
+            cap_value = "-inf"
+        else:
+            cap_value = float(float_cap).hex()
+        canonical = [
+            pd.Timestamp(day).strftime("%Y-%m-%d"),
+            code,
+            None if pd.isna(name) else str(name),
+            cap_value,
+            None if pd.isna(industry) else str(industry),
+        ]
+        digest.update(
+            json.dumps(
+                canonical,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+    return digest.hexdigest()
+
+
+def _validate_attribute_metadata(
+    metadata,
+    anchors: pd.DatetimeIndex,
+    candidates: list[str],
+    frame: pd.DataFrame,
+) -> list[dict]:
+    if not isinstance(metadata, list) or len(metadata) != len(anchors):
+        raise ValueError("attributes metadata does not cover every anchor")
+    normalized = []
+    counts = frame.groupby("date", observed=True).size()
+    for item, day in zip(metadata, anchors):
+        if not isinstance(item, dict) or set(item) != {
+            "date",
+            "query",
+            "columns",
+            "row_count",
+        }:
+            raise ValueError("attributes metadata has invalid schema")
+        date_text = day.strftime("%Y-%m-%d")
+        if item["date"] != date_text:
+            raise ValueError("attributes metadata date does not match anchor")
+        expected_query = data.build_attribute_query(day)
+        if item["query"] != expected_query:
+            raise ValueError("attributes metadata query does not match anchor")
+        columns = item["columns"]
+        if (
+            not isinstance(columns, list)
+            or not all(isinstance(column, str) for column in columns)
+        ):
+            raise ValueError("attributes metadata columns must be strings")
+        required_columns = {"股票代码", "股票简称", "所属同花顺行业"}
+        if not required_columns.issubset(columns):
+            raise ValueError("attributes metadata is missing raw response columns")
+        stamp = day.strftime("%Y%m%d")
+        cap_pattern = re.compile(
+            rf"^a股市值\(不含限售股\)\[{stamp}\]$",
+            re.IGNORECASE,
+        )
+        if sum(cap_pattern.fullmatch(column) is not None for column in columns) != 1:
+            raise ValueError("attributes metadata has invalid dated float-cap column")
+        row_count = item["row_count"]
+        normalized_count = int(counts.get(day, 0))
+        if (
+            isinstance(row_count, bool)
+            or not isinstance(row_count, int)
+            or row_count < normalized_count
+            or normalized_count != len(candidates)
+        ):
+            raise ValueError("attributes metadata has invalid row_count")
+        normalized.append({
+            "date": date_text,
+            "query": expected_query,
+            "columns": list(columns),
+            "row_count": row_count,
+        })
+    return normalized
+
+
+def _attributes_manifest_payload(
+    frame: pd.DataFrame,
+    anchors: pd.DatetimeIndex,
+    candidates: list[str],
+    metadata,
+) -> dict:
+    normalized_metadata = _validate_attribute_metadata(
+        metadata,
+        anchors,
+        candidates,
+        frame,
+    )
+    return {
+        "schema_version": ATTRIBUTES_SCHEMA_VERSION,
+        "request": {
+            "anchors": [day.strftime("%Y-%m-%d") for day in anchors],
+            "candidates": candidates,
+        },
+        "metadata": normalized_metadata,
+        "frame": {
+            "columns": ["date", "code", "name", "float_cap", "industry"],
+            "row_count": len(frame),
+            "sha256": _attributes_content_hash(frame),
+        },
+    }
+
+
+def _read_attributes_cache(
+    parquet_path: Path,
+    manifest_path: Path,
+    anchors: pd.DatetimeIndex,
+    candidates: list[str],
+    *,
+    required: bool,
+):
+    if not parquet_path.is_file() or not manifest_path.is_file():
+        if required:
+            missing = []
+            if not parquet_path.is_file():
+                missing.append("attributes")
+            if not manifest_path.is_file():
+                missing.append("attributes_manifest")
+            raise FileNotFoundError(
+                "missing validation cache files: " + ", ".join(missing)
+            )
+        return None
+    try:
+        frame = pd.read_parquet(parquet_path)
+        normalized = _validate_attributes(frame, anchors, candidates)
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("attributes completion manifest must be an object")
+        expected = _attributes_manifest_payload(
+            normalized,
+            anchors,
+            candidates,
+            payload.get("metadata"),
+        )
+        if payload != expected:
+            raise ValueError("attributes completion manifest mismatch")
+        return normalized
+    except Exception as exc:
+        if required:
+            raise ValueError(
+                "attributes cache or completion manifest is corrupt"
+            ) from exc
+        return None
 
 
 def _validate_adjusted(
@@ -514,14 +742,13 @@ def _publish_adjusted_cache(
         temporary_manifest.unlink(missing_ok=True)
 
 
-def _read_valid_cache(path: Path, validator, *args):
-    if not path.is_file():
-        return None
-    try:
-        frame = pd.read_parquet(path)
-        return validator(frame, *args)
-    except (OSError, ValueError):
-        return None
+def _publish_attributes_cache(
+    frame: pd.DataFrame,
+    parquet_path: Path,
+    manifest_path: Path,
+    payload: dict,
+) -> None:
+    _publish_adjusted_cache(frame, parquet_path, manifest_path, payload)
 
 
 def _read_manifest(day, root, candidates: list[str]) -> dict[str, str]:
@@ -796,19 +1023,37 @@ def run_fetch(args):
     anchors = plan["eval_dates"][:: _positive_integer(args.rebalance, "rebalance")]
 
     attributes_path = root / "attributes.parquet"
-    attributes = _read_valid_cache(
+    attributes_manifest_path = root / "attributes.json"
+    attributes = _read_attributes_cache(
         attributes_path,
-        _validate_attributes,
+        attributes_manifest_path,
         anchors,
         plan["candidates"],
+        required=False,
     )
     if attributes is None:
+        fetched_attributes, attribute_metadata = data.fetch_attributes(
+            anchors,
+            token,
+            return_metadata=True,
+        )
         attributes = _validate_attributes(
-            data.fetch_attributes(anchors, token),
+            fetched_attributes,
             anchors,
             plan["candidates"],
         )
-        _atomic_write_parquet(attributes, attributes_path)
+        attributes_manifest = _attributes_manifest_payload(
+            attributes,
+            anchors,
+            plan["candidates"],
+            attribute_metadata,
+        )
+        _publish_attributes_cache(
+            attributes,
+            attributes_path,
+            attributes_manifest_path,
+            attributes_manifest,
+        )
 
     adjusted_path = root / "adjusted_daily.parquet"
     adjusted_manifest_path = root / "adjusted_daily.json"
@@ -869,6 +1114,7 @@ def _load_validation_caches(args, plan: dict):
     root = Path(args.cache)
     paths = {
         "attributes": root / "attributes.parquet",
+        "attributes_manifest": root / "attributes.json",
         "adjusted_daily": root / "adjusted_daily.parquet",
         "adjusted_daily_manifest": root / "adjusted_daily.json",
         "data_coverage": root / "data_coverage.parquet",
@@ -879,14 +1125,12 @@ def _load_validation_caches(args, plan: dict):
             f"missing validation cache files: {', '.join(sorted(missing))}"
         )
     anchors = plan["eval_dates"][:: _positive_integer(args.rebalance, "rebalance")]
-    try:
-        attributes_frame = pd.read_parquet(paths["attributes"])
-    except Exception as exc:
-        raise ValueError("attributes cache is unreadable or corrupt") from exc
-    attributes = _validate_attributes(
-        attributes_frame,
+    attributes = _read_attributes_cache(
+        paths["attributes"],
+        paths["attributes_manifest"],
         anchors,
         plan["candidates"],
+        required=True,
     )
     adjusted = _read_adjusted_cache(
         paths["adjusted_daily"],
@@ -971,22 +1215,30 @@ def _normalize_raw_daily(raw: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def _pool_coverage(plan: dict, final_pool: pd.DataFrame) -> pd.DataFrame:
-    dates = plan["eval_dates"]
-    result = pd.DataFrame({"date": dates})
-    for name, frame in (
-        ("ranked_count", plan["ranked_pool"]),
-        ("daily_eligible_count", plan["eligible_pool"]),
-        ("final_count", final_pool),
-    ):
-        counts = frame.groupby("date", observed=True).size()
-        result[name] = result["date"].map(counts).fillna(0).astype(int)
-    result["pre_attribute_exclusions"] = (
-        result["ranked_count"] - result["daily_eligible_count"]
+def _pool_coverage(plan: dict, attribute_audit: pd.DataFrame) -> pd.DataFrame:
+    expected_columns = data.ATTRIBUTE_FILTER_AUDIT_COLUMNS
+    if list(attribute_audit.columns) != expected_columns:
+        raise ValueError("attribute filter audit columns do not match schema")
+    if attribute_audit["date"].tolist() != plan["eval_dates"].tolist():
+        raise ValueError("attribute filter audit does not exactly cover eval_dates")
+    result = plan["pool_audit"].merge(
+        attribute_audit,
+        on="date",
+        how="inner",
+        validate="one_to_one",
     )
-    result["attribute_exclusions"] = (
-        result["daily_eligible_count"] - result["final_count"]
-    )
+    if not result["daily_eligible_count"].equals(result["eligible_count"]):
+        raise ValueError("attribute filter audit eligible_count does not reconcile")
+    attribute_accounted = result[
+        [
+            "missing_or_stale_attribute_exclusions",
+            "st_exclusions",
+            "invalid_float_cap_exclusions",
+            "final_count",
+        ]
+    ].sum(axis=1)
+    if not result["eligible_count"].equals(attribute_accounted.astype("int64")):
+        raise ValueError("attribute filter audit exclusions do not reconcile")
     result["record_type"] = "pool"
     return result
 
@@ -1032,7 +1284,7 @@ def run_validate(args):
     raw = data.load_daily_raw(args.daily_cache)
     raw_daily = _normalize_raw_daily(raw)
 
-    final_pool = data.apply_attribute_filters(
+    final_pool, attribute_audit = data.apply_attribute_filters_with_audit(
         plan["eligible_pool"],
         attributes,
         plan["eval_dates"],
@@ -1121,7 +1373,7 @@ def run_validate(args):
         ],
         ignore_index=True,
     )
-    pool_coverage = _pool_coverage(plan, final_pool)
+    pool_coverage = _pool_coverage(plan, attribute_audit)
     coverage_output = pd.concat(
         [
             minute_coverage.assign(record_type="minute"),
@@ -1135,11 +1387,22 @@ def run_validate(args):
     adjusted_end = adjusted["date"].max().strftime("%Y-%m-%d")
     score_sample_days = int(daily_ic.get("score", pd.Series(dtype=float)).notna().sum())
     quality_exclusions = int(minute_coverage["reason"].ne("ok").sum())
-    pool_exclusions = int(
-        pool_coverage[
-            ["pre_attribute_exclusions", "attribute_exclusions"]
-        ].to_numpy().sum()
-    )
+    audit_totals = {
+        column: int(pool_coverage[column].sum())
+        for column in [
+            "age_exclusions",
+            "suspension_exclusions",
+            "missing_or_stale_attribute_exclusions",
+            "st_exclusions",
+            "invalid_float_cap_exclusions",
+        ]
+    }
+    minute_total = len(minute_coverage)
+    minute_ok = int(minute_coverage["reason"].eq("ok").sum())
+    minute_ok_rate = minute_ok / minute_total if minute_total else np.nan
+    ranked_total = int(pool_coverage["ranked_count"].sum())
+    final_total = int(pool_coverage["final_count"].sum())
+    pool_rate = final_total / ranked_total if ranked_total else np.nan
     disclosures = [
         f"固定验证区间 {plan['start'].date()} 至 {plan['end'].date()}",
         f"API 实际区间 {adjusted_start} 至 {adjusted_end}",
@@ -1151,8 +1414,16 @@ def run_validate(args):
         f"参数固定：top={plan['top']}，top_n={top_n}，"
         f"rebalance={rebalance}，min_count={min_count}",
         f"单边实际成交成本 {float(args.cost_bps)} bp；同时报告毛值与净值",
-        f"剔除统计：分钟质量/无数据 {quality_exclusions} 个股日，"
-        f"股票池/属性 {pool_exclusions} 个股日",
+        "换手定义：双边总成交额换手（买入与卖出名义金额之和/组合净值）",
+        f"剔除统计：分钟质量/无数据 {quality_exclusions} 个股日；"
+        f"年龄 {audit_totals['age_exclusions']} 个股日，"
+        f"停牌 {audit_totals['suspension_exclusions']} 个股日，"
+        f"属性缺失/陈旧 "
+        f"{audit_totals['missing_or_stale_attribute_exclusions']} 个股日，"
+        f"ST {audit_totals['st_exclusions']} 个股日，"
+        f"无效流通市值 {audit_totals['invalid_float_cap_exclusions']} 个股日",
+        f"分钟 ok率：{minute_ok}/{minute_total} = {minute_ok_rate:.2%}",
+        f"最终 pool/ranked 覆盖率：{final_total}/{ranked_total} = {pool_rate:.2%}",
         *_threshold_disclosures(summary, metrics),
     ]
     results = {

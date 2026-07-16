@@ -109,6 +109,16 @@ def test_prepare_universe_uses_lagged_adv_and_deterministic_ties():
     assert first["adv20"].tolist() == [100.0, 50.0]
     assert first["liquidity_rank"].tolist() == [1, 2]
     assert plan["candidates"] == ["000001", "000002", "000003"]
+    assert plan["pool_audit"].to_dict("records") == [
+        {
+            "date": day,
+            "ranked_count": 2,
+            "age_exclusions": 0,
+            "suspension_exclusions": 0,
+            "daily_eligible_count": 2,
+        }
+        for day in dates[2:]
+    ]
 
 
 def test_prepare_universe_filters_suspension_after_top_rank_without_replacement():
@@ -133,6 +143,13 @@ def test_prepare_universe_filters_suspension_after_top_rank_without_replacement(
     last = plan["eligible_pool"].query("date == @dates[-1]")
     assert last["code"].tolist() == ["000002"]
     assert "000003" not in last["code"].tolist()
+    assert plan["pool_audit"].iloc[-1].to_dict() == {
+        "date": dates[-1],
+        "ranked_count": 2,
+        "age_exclusions": 0,
+        "suspension_exclusions": 1,
+        "daily_eligible_count": 1,
+    }
 
 
 def test_prepare_universe_filters_young_stock_after_top_rank():
@@ -160,6 +177,13 @@ def test_prepare_universe_filters_young_stock_after_top_rank():
     eligible = plan["eligible_pool"].query("date == @dates[-1]")
     assert ranked["code"].tolist() == ["000001", "000002"]
     assert eligible["code"].tolist() == ["000002"]
+    assert plan["pool_audit"].to_dict("records") == [{
+        "date": dates[-1],
+        "ranked_count": 2,
+        "age_exclusions": 1,
+        "suspension_exclusions": 0,
+        "daily_eligible_count": 1,
+    }]
 
 
 def test_prepare_universe_includes_warmup_dates_and_estimates_three_fields():
@@ -195,6 +219,7 @@ def test_prepare_universe_returns_typed_empty_plan_outside_available_dates():
         "fetch_dates",
         "ranked_pool",
         "eligible_pool",
+        "pool_audit",
         "candidates",
         "estimated_rows",
         "estimated_cells",
@@ -207,6 +232,14 @@ def test_prepare_universe_returns_typed_empty_plan_outside_available_dates():
     expected_columns = ["date", "code", "adv20", "liquidity_rank"]
     assert plan["ranked_pool"].columns.tolist() == expected_columns
     assert plan["eligible_pool"].columns.tolist() == expected_columns
+    assert plan["pool_audit"].columns.tolist() == [
+        "date",
+        "ranked_count",
+        "age_exclusions",
+        "suspension_exclusions",
+        "daily_eligible_count",
+    ]
+    assert plan["pool_audit"].empty
 
 
 def test_normalize_minute_day_records_amount_mismatch():
@@ -1490,6 +1523,37 @@ def test_fetch_attributes_queries_each_unique_anchor_once_and_retries(monkeypatc
     ]
 
 
+def test_fetch_attributes_optionally_returns_raw_query_metadata(monkeypatch):
+    day = pd.Timestamp("2026-01-12")
+    query = intraday_data.build_attribute_query(day)
+    raw = pd.DataFrame({
+        "股票代码": ["000001.SZ"],
+        "股票简称": ["平安银行"],
+        "A股市值(不含限售股)[20260112]": [1.2e11],
+        "所属同花顺行业": ["银行"],
+        "响应附加列": ["raw provenance"],
+    })
+    monkeypatch.setattr(
+        intraday_data.ths_http,
+        "smart_stock_picking",
+        lambda *args, **kwargs: raw,
+    )
+
+    result, metadata = intraday_data.fetch_attributes(
+        [day],
+        "token",
+        return_metadata=True,
+    )
+
+    assert result["code"].tolist() == ["000001"]
+    assert metadata == [{
+        "date": "2026-01-12",
+        "query": query,
+        "columns": raw.columns.tolist(),
+        "row_count": 1,
+    }]
+
+
 def test_fetch_attributes_returns_schema_for_empty_anchor_list(monkeypatch):
     calls = []
     monkeypatch.setattr(
@@ -1505,6 +1569,13 @@ def test_fetch_attributes_returns_schema_for_empty_anchor_list(monkeypatch):
     assert result.columns.tolist() == [
         "date", "code", "name", "float_cap", "industry"
     ]
+    result_with_metadata, metadata = intraday_data.fetch_attributes(
+        [],
+        "token",
+        return_metadata=True,
+    )
+    pd.testing.assert_frame_equal(result_with_metadata, result)
+    assert metadata == []
 
 
 def test_apply_attribute_filters_drops_case_insensitive_st_and_invalid_cap_without_replacement():
@@ -1529,6 +1600,94 @@ def test_apply_attribute_filters_drops_case_insensitive_st_and_invalid_cap_witho
 
     assert result["code"].tolist() == ["000001"]
     assert result["liquidity_rank"].tolist() == [1]
+
+
+def test_apply_attribute_filters_with_audit_uses_mutually_exclusive_funnel():
+    eval_dates = pd.bdate_range("2026-01-12", periods=6)
+    codes = ["000001", "000002", "000003", "000004", "000005", "000006"]
+    pool = pd.DataFrame({
+        "date": [eval_dates[0]] * len(codes) + [eval_dates[-1]],
+        "code": codes + ["000001"],
+        "liquidity_rank": list(range(1, len(codes) + 1)) + [1],
+    })
+    attributes = pd.DataFrame({
+        "date": eval_dates[0],
+        "code": ["000001", "000002", "000003", "000005", "000006"],
+        "name": ["正常", "ST测试", "零市值", pd.NA, "*st且零市值"],
+        "float_cap": [1e11, 2e10, 0.0, 4e10, 0.0],
+        "industry": ["行业"] * 5,
+    })
+
+    filtered, audit = intraday_data.apply_attribute_filters_with_audit(
+        pool,
+        attributes,
+        eval_dates,
+    )
+
+    assert filtered[["date", "code", "liquidity_rank"]].to_dict("records") == [{
+        "date": eval_dates[0],
+        "code": "000001",
+        "liquidity_rank": 1,
+    }]
+    assert audit.to_dict("records") == [
+        {
+            "date": eval_dates[0],
+            "eligible_count": 6,
+            "missing_or_stale_attribute_exclusions": 2,
+            "st_exclusions": 2,
+            "invalid_float_cap_exclusions": 1,
+            "final_count": 1,
+        },
+        *[
+            {
+                "date": day,
+                "eligible_count": 0,
+                "missing_or_stale_attribute_exclusions": 0,
+                "st_exclusions": 0,
+                "invalid_float_cap_exclusions": 0,
+                "final_count": 0,
+            }
+            for day in eval_dates[1:-1]
+        ],
+        {
+            "date": eval_dates[-1],
+            "eligible_count": 1,
+            "missing_or_stale_attribute_exclusions": 1,
+            "st_exclusions": 0,
+            "invalid_float_cap_exclusions": 0,
+            "final_count": 0,
+        },
+    ]
+    assert (
+        audit["eligible_count"]
+        == audit[
+            [
+                "missing_or_stale_attribute_exclusions",
+                "st_exclusions",
+                "invalid_float_cap_exclusions",
+                "final_count",
+            ]
+        ].sum(axis=1)
+    ).all()
+    pd.testing.assert_frame_equal(
+        intraday_data.apply_attribute_filters(pool, attributes, eval_dates),
+        filtered,
+    )
+
+
+def test_apply_attribute_filters_with_audit_covers_empty_eval_days():
+    eval_dates = pd.bdate_range("2026-01-12", periods=2)
+    empty_pool = pd.DataFrame(columns=["date", "code", "liquidity_rank"])
+
+    filtered, audit = intraday_data.apply_attribute_filters_with_audit(
+        empty_pool,
+        pd.DataFrame(),
+        eval_dates,
+    )
+
+    assert filtered.empty
+    assert audit["date"].tolist() == eval_dates.tolist()
+    assert audit.drop(columns="date").eq(0).all().all()
 
 
 def test_apply_attribute_filters_allows_four_eval_day_lag_not_five():

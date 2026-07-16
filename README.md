@@ -57,6 +57,19 @@ pip install -r alpha101/requirements.txt
 export THS_HTTP_REFRESH_TOKEN='...'
 ```
 
+先以固定的不复权口径生成日线前置缓存：
+
+```bash
+python -m alpha101.ths_history fetch --universe data/a-2026-07-07.json --start 2022-07-01 --end 2026-07-10 --cache alpha101/cache/ths_panel.pkl --batch-size 80
+```
+
+该请求显式使用 `CPS=1`（不复权）和 `Fill=Omit`。缓存必需 schema 为
+`code,date,open,high,low,close,volume,amount`；本次复现缓存含 4,873,244 行、
+5,203 个代码。输入股票池 `data/a-2026-07-07.json` 的 SHA256 为
+`abc0256b0985eca70ef4b4afb88e2cc8934bfb0a7174ed7be35fcd22443ed583`，生成的
+`alpha101/cache/ths_panel.pkl` SHA256 为
+`783f2580d90347554111ff0b91ce0df4f5ce654ad62c28b01ac7f1f75a3adc84`。
+
 按阶段运行便于在真实下载中安全续传：
 
 ```bash
