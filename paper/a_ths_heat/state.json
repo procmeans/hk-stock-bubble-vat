@@ -1,6 +1,37 @@
 {
- "account": "a_ths_heat", "capital": 100000.0, "cash": 100000.0,
- "positions": {}, "pending_targets": null, "days_since_rebalance": null,
- "bench_nav": 100000.0, "last_run": null, "strategy": "ths_heat",
- "market": "a", "params": {"top_n": 20, "rebalance": 2}
+ "account": "a_ths_heat",
+ "capital": 100000.0,
+ "cash": 100000.0,
+ "positions": {},
+ "pending_targets": {
+  "603538": 0.05,
+  "603986": 0.05,
+  "001309": 0.05,
+  "600584": 0.05,
+  "000938": 0.05,
+  "002185": 0.05,
+  "600664": 0.05,
+  "002384": 0.05,
+  "603127": 0.05,
+  "000725": 0.05,
+  "600487": 0.05,
+  "688008": 0.05,
+  "600436": 0.05,
+  "002354": 0.05,
+  "002747": 0.05,
+  "002466": 0.05,
+  "002156": 0.05,
+  "002396": 0.05,
+  "600162": 0.05,
+  "000566": 0.05
+ },
+ "days_since_rebalance": 0,
+ "bench_nav": 97031.80586154536,
+ "last_run": "2026-07-16",
+ "strategy": "ths_heat",
+ "market": "a",
+ "params": {
+  "top_n": 20,
+  "rebalance": 2
+ }
 }
