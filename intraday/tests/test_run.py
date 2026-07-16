@@ -108,9 +108,16 @@ def test_parser_defaults_are_pinned():
     assert args.rebalance == 5
     assert args.cost_bps == 20.0
     assert args.min_count == 400
+    assert args.batch_size == 200
     assert args.daily_cache == Path("alpha101/cache/ths_panel.pkl")
     assert args.cache == Path("intraday/cache")
     assert args.output == Path("output/intraday_6m")
+
+
+def test_parser_accepts_smaller_operational_fetch_batch():
+    args = build_parser().parse_args(["fetch", "--batch-size", "100"])
+
+    assert args.batch_size == 100
 
 
 def test_all_four_subcommands_share_identical_defaults():
@@ -446,6 +453,7 @@ def _prepared_fetch_case(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("intraday.data.load_daily_raw", lambda _: raw)
     run_prepare(args)
+    assert "batch_size" not in _load_plan(args.cache)["parameters"]
     return args, raw, dates
 
 
@@ -587,7 +595,8 @@ def _install_no_data_fetch_fakes(
             ]
         )
 
-    def fetch_minutes(fetch_plan, raw, root, token):
+    def fetch_minutes(fetch_plan, raw, root, token, batch_size):
+        assert batch_size == 200
         for day in fetch_plan["fetch_dates"]:
             if not intraday_data.day_complete(day, fetch_plan["candidates"], root):
                 intraday_data.write_day_partition(
@@ -693,8 +702,10 @@ def test_fetch_uses_one_token_and_atomically_resumes_complete_caches(
 ):
     args, _, dates = _prepared_fetch_case(tmp_path, monkeypatch)
     plan = _load_plan(args.cache)
+    args.batch_size = 100
     token_calls = []
     calls = {"attributes": 0, "adjusted": 0, "minute": 0}
+    batch_sizes = []
 
     def get_token():
         token_calls.append("called")
@@ -730,8 +741,9 @@ def test_fetch_uses_one_token_and_atomically_resumes_complete_caches(
             ]
         )
 
-    def fetch_minutes(fetch_plan, raw, root, token):
+    def fetch_minutes(fetch_plan, raw, root, token, batch_size):
         calls["minute"] += 1
+        batch_sizes.append(batch_size)
         assert token == "one-token"
         for day in fetch_plan["fetch_dates"]:
             if not intraday_data.day_complete(day, fetch_plan["candidates"], root):
@@ -764,6 +776,7 @@ def test_fetch_uses_one_token_and_atomically_resumes_complete_caches(
 
     assert token_calls == ["called"]
     assert calls == {"attributes": 1, "adjusted": 1, "minute": 1}
+    assert batch_sizes == [100]
     assert not list(args.cache.rglob("*.tmp"))
     assert len(coverage) == len(plan["fetch_dates"]) * len(plan["candidates"])
     assert not coverage.duplicated(["date", "code"]).any()
@@ -773,12 +786,30 @@ def test_fetch_uses_one_token_and_atomically_resumes_complete_caches(
     resumed = run_fetch(args)
     assert token_calls == ["called"]
     assert calls == {"attributes": 1, "adjusted": 1, "minute": 2}
+    assert batch_sizes == [100, 100]
     updated = resumed.loc[
         resumed["date"].eq(plan["fetch_dates"][0])
         & resumed["code"].eq(plan["candidates"][0]),
         "amount_relative_error",
     ]
     assert pd.isna(updated.iloc[0])
+
+
+@pytest.mark.parametrize("batch_size", [0, -1])
+def test_fetch_rejects_invalid_batch_size_before_token(
+    tmp_path,
+    monkeypatch,
+    batch_size,
+):
+    args, _, _ = _prepared_fetch_case(tmp_path, monkeypatch)
+    args.batch_size = batch_size
+    monkeypatch.setattr(
+        "alpha101.ths_http.get_access_token",
+        lambda: pytest.fail("invalid batch size must fail before token"),
+    )
+
+    with pytest.raises(ValueError, match="batch_size must be a positive integer"):
+        run_fetch(args)
 
 
 def test_fetch_does_not_accept_corrupt_complete_minute_partition(
@@ -815,7 +846,8 @@ def test_fetch_does_not_accept_corrupt_complete_minute_partition(
         ),
     )
 
-    def fetch_minutes(fetch_plan, raw, root, token):
+    def fetch_minutes(fetch_plan, raw, root, token, batch_size):
+        assert batch_size == 200
         for day in fetch_plan["fetch_dates"]:
             intraday_data.write_day_partition(
                 _empty_minute_frame(),

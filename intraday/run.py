@@ -39,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
         item.add_argument("--rebalance", type=int, default=5)
         item.add_argument("--cost-bps", type=float, default=20.0)
         item.add_argument("--min-count", type=int, default=400)
+        item.add_argument("--batch-size", type=int, default=200)
     return parser
 
 
@@ -786,6 +787,7 @@ def run_fetch(args):
     """Resume the immutable prepared plan with one access token per run."""
     plan = _load_plan(args.cache)
     _assert_cli_matches_plan(args, plan)
+    batch_size = _positive_integer(args.batch_size, "batch_size")
     raw = data.load_daily_raw(args.daily_cache)
     token = ths_http.get_access_token()
     root = Path(args.cache)
@@ -843,7 +845,13 @@ def run_fetch(args):
 
     coverage_path = root / "data_coverage.parquet"
     previous = _existing_coverage(coverage_path)
-    delta = data.fetch_minute_partitions(plan, raw, root, token)
+    delta = data.fetch_minute_partitions(
+        plan,
+        raw,
+        root,
+        token,
+        batch_size=batch_size,
+    )
     if delta.empty:
         delta = pd.DataFrame(columns=data.COVERAGE_COLUMNS)
     else:
