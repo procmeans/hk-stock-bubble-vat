@@ -3,11 +3,37 @@
  "capital": 100000.0,
  "cash": 100000.0,
  "positions": {},
- "pending_targets": null,
- "days_since_rebalance": null,
- "bench_nav": 100000.0,
- "last_run": null,
+ "pending_targets": {
+  "601995": 0.05,
+  "002038": 0.05,
+  "601888": 0.05,
+  "300759": 0.05,
+  "688321": 0.05,
+  "002412": 0.05,
+  "001388": 0.05,
+  "002536": 0.05,
+  "603501": 0.05,
+  "301584": 0.05,
+  "300164": 0.05,
+  "300209": 0.05,
+  "000759": 0.05,
+  "300937": 0.05,
+  "002582": 0.05,
+  "688192": 0.05,
+  "002310": 0.05,
+  "002422": 0.05,
+  "002490": 0.05,
+  "601628": 0.05
+ },
+ "days_since_rebalance": 0,
+ "bench_nav": 97031.80586154536,
+ "last_run": "2026-07-16",
  "strategy": "ths_attention_funnel",
  "market": "a",
- "params": {"top_n": 20, "candidate_n": 100, "rebalance": 2, "min_history": 60}
+ "params": {
+  "top_n": 20,
+  "candidate_n": 100,
+  "rebalance": 2,
+  "min_history": 60
+ }
 }
