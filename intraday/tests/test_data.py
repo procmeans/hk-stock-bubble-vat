@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+import requests
 
 import intraday.data as intraday_data
 from intraday.data import (
@@ -745,3 +746,473 @@ def test_existing_partition_is_invalidated_when_publish_fails_and_retry_recovers
     assert day_complete(day, ["000001"], tmp_path)
     assert parquet.read_text() == "20.0"
     assert not previous_manifest.exists()
+
+
+def _http_error(status):
+    response = requests.Response()
+    response.status_code = status
+    return requests.HTTPError(f"HTTP {status}", response=response)
+
+
+def test_retry_uses_fixed_backoff_then_recovers():
+    calls = []
+    waits = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) < 3:
+            raise requests.Timeout("temporary")
+        return "ok"
+
+    assert intraday_data._retry(flaky, sleeper=waits.append) == "ok"
+    assert len(calls) == 3
+    assert waits == [1, 2]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        requests.ConnectionError("disconnected"),
+        _http_error(429),
+        _http_error(500),
+        _http_error(503),
+    ],
+    ids=["connection", "429", "500", "503"],
+)
+def test_retry_classifies_transient_errors(error):
+    calls = []
+    waits = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise error
+        return "recovered"
+
+    assert intraday_data._retry(flaky, sleeper=waits.append) == "recovered"
+    assert len(calls) == 2
+    assert waits == [1]
+
+
+@pytest.mark.parametrize("status", [400, 401, 404])
+def test_retry_raises_permanent_http_errors_immediately(status):
+    waits = []
+    error = _http_error(status)
+
+    with pytest.raises(requests.HTTPError) as caught:
+        intraday_data._retry(lambda: (_ for _ in ()).throw(error),
+                             sleeper=waits.append)
+
+    assert caught.value is error
+    assert waits == []
+
+
+def test_retry_stops_after_all_fixed_backoffs():
+    calls = []
+    waits = []
+
+    def unavailable():
+        calls.append(1)
+        raise requests.Timeout("still unavailable")
+
+    with pytest.raises(requests.Timeout, match="still unavailable"):
+        intraday_data._retry(unavailable, sleeper=waits.append)
+
+    assert len(calls) == 4
+    assert waits == [1, 2, 4]
+
+
+def test_fetch_minute_batches_codes_with_market_suffixes_and_exact_parameters(
+    monkeypatch,
+    tmp_path,
+):
+    day = pd.Timestamp("2026-01-12")
+    plan = {
+        "candidates": ["000001", "600000", "430001", "920001"],
+        "fetch_dates": pd.DatetimeIndex([day]),
+    }
+    raw_daily = pd.DataFrame({
+        "code": plan["candidates"],
+        "date": day,
+        "amount": 1_000.0,
+    })
+    calls = []
+
+    def fake_high_frequency(codes, indicators, starttime, endtime, **kwargs):
+        calls.append((codes, indicators, starttime, endtime, kwargs))
+        return pd.DataFrame()
+
+    monkeypatch.setattr(intraday_data.ths_http, "high_frequency",
+                        fake_high_frequency)
+    monkeypatch.setattr(pd.DataFrame, "to_parquet",
+                        lambda self, path, index: Path(path).write_text("empty"))
+
+    result = intraday_data.fetch_minute_partitions(
+        plan, raw_daily, tmp_path, "token", batch_size=2
+    )
+
+    assert [call[0] for call in calls] == [
+        ["000001.SZ", "600000.SH"],
+        ["430001.BJ", "920001.BJ"],
+    ]
+    assert all(call[1] == "close,volume,amount" for call in calls)
+    assert all(call[2] == "2026-01-12 09:30:00" for call in calls)
+    assert all(call[3] == "2026-01-12 15:00:00" for call in calls)
+    assert all(call[4] == {
+        "functionpara": {
+            "CPS": "no",
+            "Fill": "Original",
+            "Timeformat": "LocalTime",
+            "Limitstart": "09:30:00",
+            "Limitend": "15:00:00",
+        },
+        "access_token": "token",
+    } for call in calls)
+    assert result.empty
+    assert day_complete(day, plan["candidates"], tmp_path)
+
+
+def test_fetch_minute_records_partial_statuses_and_reconciles_cps1_amount(
+    monkeypatch,
+    tmp_path,
+):
+    day = pd.Timestamp("2026-01-12")
+    candidates = ["000001", "000002", "600000"]
+    plan = {
+        "candidates": candidates,
+        "fetch_dates": pd.DatetimeIndex([day]),
+    }
+    raw_daily = pd.DataFrame({
+        "code": candidates,
+        "date": day,
+        "amount": [1_000.0, 2_000.0, 3_000.0],
+    })
+    returned = _minute_frame(count=200, amount=5.0)
+    responses = iter([returned, pd.DataFrame()])
+    written = []
+
+    monkeypatch.setattr(
+        intraday_data.ths_http,
+        "high_frequency",
+        lambda *args, **kwargs: next(responses),
+    )
+    monkeypatch.setattr(
+        intraday_data,
+        "write_day_partition",
+        lambda frame, statuses, candidate_day, root: written.append(
+            (frame.copy(), statuses.copy(), candidate_day, root)
+        ),
+    )
+
+    coverage = intraday_data.fetch_minute_partitions(
+        plan, raw_daily, tmp_path, "token", batch_size=2
+    )
+
+    clean, statuses, written_day, written_root = written[0]
+    assert statuses == {
+        "000001": "returned",
+        "000002": "no_data",
+        "600000": "no_data",
+    }
+    assert written_day == day
+    assert written_root == tmp_path
+    assert clean["amount"].sum() == 1_000.0
+    assert clean["volume"].sum() == 200.0
+    assert coverage[["code", "reason"]].to_dict("records") == [
+        {"code": "000001", "reason": "ok"}
+    ]
+
+
+def test_fetch_minute_skips_completed_day(monkeypatch, tmp_path):
+    day = pd.Timestamp("2026-01-12")
+    plan = {
+        "candidates": ["000001"],
+        "fetch_dates": pd.DatetimeIndex([day]),
+    }
+    raw_daily = pd.DataFrame({
+        "code": ["000001"],
+        "date": [day],
+        "amount": [1_000.0],
+    })
+    empty = pd.DataFrame(columns=["code", "time", "close", "volume", "amount"])
+    monkeypatch.setattr(pd.DataFrame, "to_parquet",
+                        lambda self, path, index: Path(path).write_text("empty"))
+    write_day_partition(empty, {"000001": "no_data"}, day, tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        intraday_data.ths_http,
+        "high_frequency",
+        lambda *args, **kwargs: calls.append(args) or pd.DataFrame(),
+    )
+
+    result = intraday_data.fetch_minute_partitions(
+        plan, raw_daily, tmp_path, "token"
+    )
+
+    assert calls == []
+    assert result.empty
+
+
+def test_fetch_minute_handles_empty_candidate_batch_without_request(
+    monkeypatch,
+    tmp_path,
+):
+    day = pd.Timestamp("2026-01-12")
+    calls = []
+    written = []
+    monkeypatch.setattr(
+        intraday_data.ths_http,
+        "high_frequency",
+        lambda *args, **kwargs: calls.append(args) or pd.DataFrame(),
+    )
+    monkeypatch.setattr(
+        intraday_data,
+        "write_day_partition",
+        lambda frame, statuses, candidate_day, root: written.append(
+            (frame.copy(), statuses.copy())
+        ),
+    )
+
+    result = intraday_data.fetch_minute_partitions(
+        {"candidates": [], "fetch_dates": pd.DatetimeIndex([day])},
+        pd.DataFrame(columns=["code", "date", "amount"]),
+        tmp_path,
+        "token",
+    )
+
+    assert calls == []
+    assert len(written) == 1
+    assert written[0][0].empty
+    assert written[0][1] == {}
+    assert result.empty
+
+
+def test_fetch_adjusted_daily_uses_cps3_batches_and_normalizes(monkeypatch):
+    calls = []
+    first = pd.DataFrame({
+        "thscode": ["000001.SZ", "000001.SZ", "600000.SH"],
+        "time": ["2026-01-12", "2026-01-12", "2026-01-13"],
+        "open": ["10", "99", "20"],
+        "close": ["11", "99", "21"],
+        "amount": [1, 2, 3],
+    })
+    responses = iter([first, pd.DataFrame()])
+
+    def fake_history(codes, indicators, start, end, **kwargs):
+        calls.append((codes, indicators, start, end, kwargs))
+        return next(responses)
+
+    monkeypatch.setattr(intraday_data.ths_http, "history_quotation", fake_history)
+
+    result = intraday_data.fetch_adjusted_daily(
+        ["000001", "600000", "430001", "920001"],
+        "2026-01-01",
+        "2026-01-31",
+        "token",
+        batch_size=2,
+    )
+
+    assert [call[0] for call in calls] == [
+        ["000001.SZ", "600000.SH"],
+        ["430001.BJ", "920001.BJ"],
+    ]
+    assert all(call[1] == "open,close" for call in calls)
+    assert all(call[2:4] == ("2026-01-01", "2026-01-31") for call in calls)
+    assert all(call[4] == {
+        "functionpara": {"CPS": "3", "Fill": "Omit"},
+        "access_token": "token",
+    } for call in calls)
+    assert result.columns.tolist() == ["code", "date", "open", "close"]
+    assert result.to_dict("records") == [
+        {
+            "code": "000001",
+            "date": pd.Timestamp("2026-01-12"),
+            "open": 10,
+            "close": 11,
+        },
+        {
+            "code": "600000",
+            "date": pd.Timestamp("2026-01-13"),
+            "open": 20,
+            "close": 21,
+        },
+    ]
+
+
+@pytest.mark.parametrize("codes", [[], ["000001"]], ids=["empty-batch", "empty-response"])
+def test_fetch_adjusted_daily_rejects_no_rows(monkeypatch, codes):
+    calls = []
+    monkeypatch.setattr(
+        intraday_data.ths_http,
+        "history_quotation",
+        lambda *args, **kwargs: calls.append(args) or pd.DataFrame(),
+    )
+
+    with pytest.raises(RuntimeError, match="adjusted history returned no rows"):
+        intraday_data.fetch_adjusted_daily(
+            codes, "2026-01-01", "2026-01-31", "token"
+        )
+
+    assert len(calls) == bool(codes)
+
+
+def test_fetch_adjusted_daily_retries_transient_request_error(monkeypatch):
+    calls = []
+
+    def flaky(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise requests.ConnectionError("temporary")
+        return pd.DataFrame({
+            "thscode": ["000001.SZ"],
+            "time": ["2026-01-12"],
+            "open": [10],
+            "close": [11],
+        })
+
+    monkeypatch.setattr(intraday_data.ths_http, "history_quotation", flaky)
+    monkeypatch.setattr(intraday_data.time, "sleep", lambda seconds: None)
+
+    result = intraday_data.fetch_adjusted_daily(
+        ["000001"], "2026-01-01", "2026-01-31", "token"
+    )
+
+    assert len(calls) == 2
+    assert result["code"].tolist() == ["000001"]
+
+
+def test_build_attribute_query_binds_requested_date():
+    assert intraday_data.build_attribute_query("2026-01-02") == (
+        "2026年1月2日A股，2026年1月2日流通市值，所属同花顺行业"
+    )
+
+
+def test_normalize_attributes_finds_only_matching_dated_float_cap():
+    raw = pd.DataFrame({
+        "股票代码": ["000001.SZ", "000001.SZ", "not-a-code"],
+        "股票简称": ["平安银行", "重复记录", "无代码"],
+        "a股市值(不含限售股)[20260109]": [9.9e10, 9.8e10, 1.0],
+        "a股市值(不含限售股)[20260112]": [1.2e11, 1.1e11, 2.0],
+        "所属同花顺行业": ["银行-股份制银行", "银行", "未知"],
+    })
+
+    result = intraday_data.normalize_attributes(raw, pd.Timestamp("2026-01-12"))
+
+    assert result.columns.tolist() == [
+        "date", "code", "name", "float_cap", "industry"
+    ]
+    assert result.to_dict("records") == [{
+        "date": pd.Timestamp("2026-01-12"),
+        "code": "000001",
+        "name": "平安银行",
+        "float_cap": 1.2e11,
+        "industry": "银行-股份制银行",
+    }]
+
+
+def test_normalize_attributes_requires_matching_dated_float_cap():
+    raw = pd.DataFrame({
+        "股票代码": ["000001.SZ"],
+        "股票简称": ["平安银行"],
+        "a股市值(不含限售股)[20260109]": [1.2e11],
+        "所属同花顺行业": ["银行"],
+    })
+
+    with pytest.raises(ValueError, match="missing dated float cap for 20260112"):
+        intraday_data.normalize_attributes(raw, "2026-01-12")
+
+
+def test_fetch_attributes_queries_each_unique_anchor_once_and_retries(monkeypatch):
+    calls = []
+
+    def fake_query(query, **kwargs):
+        calls.append((query, kwargs))
+        if len(calls) == 1:
+            raise requests.Timeout("temporary")
+        stamp = "20260112" if "1月12日" in query else "20260119"
+        return pd.DataFrame({
+            "股票代码": ["000001.SZ"],
+            "股票简称": ["平安银行"],
+            f"a股市值(不含限售股)[{stamp}]": [1.2e11],
+            "所属同花顺行业": ["银行"],
+        })
+
+    monkeypatch.setattr(intraday_data.ths_http, "smart_stock_picking", fake_query)
+    monkeypatch.setattr(intraday_data.time, "sleep", lambda seconds: None)
+
+    result = intraday_data.fetch_attributes(
+        ["2026-01-19", "2026-01-12", "2026-01-12"], "token"
+    )
+
+    successful_queries = [query for query, _ in calls[1:]]
+    assert successful_queries == [
+        intraday_data.build_attribute_query("2026-01-12"),
+        intraday_data.build_attribute_query("2026-01-19"),
+    ]
+    assert all(kwargs == {"access_token": "token", "timeout": 90}
+               for _, kwargs in calls)
+    assert result["date"].tolist() == [
+        pd.Timestamp("2026-01-12"),
+        pd.Timestamp("2026-01-19"),
+    ]
+
+
+def test_fetch_attributes_returns_schema_for_empty_anchor_list(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        intraday_data.ths_http,
+        "smart_stock_picking",
+        lambda *args, **kwargs: calls.append(args) or pd.DataFrame(),
+    )
+
+    result = intraday_data.fetch_attributes([], "token")
+
+    assert calls == []
+    assert result.empty
+    assert result.columns.tolist() == [
+        "date", "code", "name", "float_cap", "industry"
+    ]
+
+
+def test_apply_attribute_filters_drops_case_insensitive_st_and_invalid_cap_without_replacement():
+    day = pd.Timestamp("2026-01-12")
+    codes = ["000001", "000002", "000003", "000004", "000005", "000006"]
+    pool = pd.DataFrame({
+        "date": day,
+        "code": codes,
+        "liquidity_rank": range(1, len(codes) + 1),
+    })
+    attributes = pd.DataFrame({
+        "date": day,
+        "code": codes,
+        "name": ["平安银行", "st测试", "*St测试", "零市值", "负市值", "无限市值"],
+        "float_cap": [1e11, 2e10, 3e10, 0.0, -1.0, np.inf],
+        "industry": ["银行"] * len(codes),
+    })
+
+    result = intraday_data.apply_attribute_filters(
+        pool, attributes, pd.DatetimeIndex([day])
+    )
+
+    assert result["code"].tolist() == ["000001"]
+    assert result["liquidity_rank"].tolist() == [1]
+
+
+def test_apply_attribute_filters_allows_four_eval_day_lag_not_five():
+    eval_dates = pd.bdate_range("2026-01-12", periods=6)
+    pool = pd.DataFrame({
+        "date": eval_dates,
+        "code": "000001",
+    })
+    attributes = pd.DataFrame({
+        "date": [eval_dates[0], eval_dates[0]],
+        "code": ["000001", "000001"],
+        "name": ["平安银行", "重复记录"],
+        "float_cap": [1e11, 2e11],
+        "industry": ["银行", "银行"],
+    })
+
+    result = intraday_data.apply_attribute_filters(pool, attributes, eval_dates)
+
+    assert result["date"].tolist() == eval_dates[:5].tolist()
+    assert result["code"].tolist() == ["000001"] * 5

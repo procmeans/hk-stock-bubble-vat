@@ -1,11 +1,16 @@
 """Daily-data preparation for the dynamic intraday research universe."""
 
 import json
-from datetime import time
+import time
+from datetime import time as clock_time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import requests
+
+from alpha101 import ths_http
+from alpha101.ths_today import chunks
 
 
 MINUTE_DTYPES = {
@@ -24,6 +29,15 @@ COVERAGE_DTYPES = {
 }
 MINUTE_COLUMNS = list(MINUTE_DTYPES)
 COVERAGE_COLUMNS = list(COVERAGE_DTYPES)
+
+
+def _to_thscode(code) -> str:
+    code = str(code).zfill(6)
+    if code.startswith(("4", "8", "92")):
+        return f"{code}.BJ"
+    if code.startswith(("6", "9")):
+        return f"{code}.SH"
+    return f"{code}.SZ"
 
 
 def _empty_typed_frame(dtypes) -> pd.DataFrame:
@@ -144,12 +158,12 @@ def normalize_minute_day(
     valid_day = data["time"].dt.normalize().eq(pd.Timestamp(day).normalize())
     valid_time = valid_day & (
         (
-            (data["time"].dt.time >= time(9, 30))
-            & (data["time"].dt.time <= time(11, 30))
+            (data["time"].dt.time >= clock_time(9, 30))
+            & (data["time"].dt.time <= clock_time(11, 30))
         )
         | (
-            (data["time"].dt.time >= time(13, 0))
-            & (data["time"].dt.time <= time(15, 0))
+            (data["time"].dt.time >= clock_time(13, 0))
+            & (data["time"].dt.time <= clock_time(15, 0))
         )
     )
     valid_values = (
@@ -283,3 +297,259 @@ def day_complete(day, codes, root) -> bool:
     if not all(isinstance(code, str) for code in requested_codes):
         return False
     return set(statuses) == set(requested_codes)
+
+
+def _retry(call, waits=(1, 2, 4), sleeper=None):
+    """Retry temporary request failures with the fixed iFinD backoff."""
+    sleeper = time.sleep if sleeper is None else sleeper
+    waits = tuple(waits)
+    for attempt in range(len(waits) + 1):
+        try:
+            return call()
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt == len(waits):
+                raise
+            sleeper(waits[attempt])
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            temporary = status == 429 or (
+                status is not None and 500 <= status <= 599
+            )
+            if not temporary or attempt == len(waits):
+                raise
+            sleeper(waits[attempt])
+
+
+def fetch_minute_partitions(
+    plan,
+    raw_daily,
+    root,
+    access_token,
+    batch_size=200,
+) -> pd.DataFrame:
+    """Download, validate, and cache each unfinished minute partition."""
+    candidates = list(plan["candidates"])
+    daily = raw_daily.copy()
+    daily["code"] = daily["code"].astype(str).str.zfill(6)
+    daily["date"] = pd.to_datetime(daily["date"]).dt.normalize()
+    coverage_frames = []
+
+    for value in plan["fetch_dates"]:
+        day = pd.Timestamp(value).normalize()
+        if day_complete(day, candidates, root):
+            continue
+
+        frames = []
+        for batch in chunks(candidates, batch_size):
+            thscodes = [_to_thscode(code) for code in batch]
+
+            def fetch_batch(thscodes=thscodes, day=day):
+                return ths_http.high_frequency(
+                    thscodes,
+                    "close,volume,amount",
+                    f"{day:%Y-%m-%d} 09:30:00",
+                    f"{day:%Y-%m-%d} 15:00:00",
+                    functionpara={
+                        "CPS": "no",
+                        "Fill": "Original",
+                        "Timeformat": "LocalTime",
+                        "Limitstart": "09:30:00",
+                        "Limitend": "15:00:00",
+                    },
+                    access_token=access_token,
+                )
+
+            frame = _retry(fetch_batch)
+            if not frame.empty:
+                frames.append(frame)
+
+        joined = (
+            pd.concat(frames, ignore_index=True)
+            if frames
+            else pd.DataFrame()
+        )
+        returned = set(
+            joined.get("thscode", pd.Series(dtype="string"))
+            .astype(str)
+            .str.extract(r"(\d{6})", expand=False)
+            .dropna()
+        )
+        statuses = {
+            code: "returned" if code in returned else "no_data"
+            for code in candidates
+        }
+        amounts = (
+            daily.loc[daily["date"].eq(day), ["code", "amount"]]
+            .set_index("code")["amount"]
+        )
+        clean, coverage = normalize_minute_day(joined, day, amounts)
+        write_day_partition(clean, statuses, day, root)
+        if not coverage.empty:
+            coverage_frames.append(coverage)
+
+    if not coverage_frames:
+        return _empty_typed_frame(COVERAGE_DTYPES)
+    return pd.concat(coverage_frames, ignore_index=True).astype(COVERAGE_DTYPES)
+
+
+def fetch_adjusted_daily(
+    codes,
+    start,
+    end,
+    access_token,
+    batch_size=200,
+) -> pd.DataFrame:
+    """Download CPS3 adjusted open and close history in bounded batches."""
+    frames = []
+    for batch in chunks(list(codes), batch_size):
+        thscodes = [_to_thscode(code) for code in batch]
+
+        def fetch_batch(thscodes=thscodes):
+            return ths_http.history_quotation(
+                thscodes,
+                "open,close",
+                start,
+                end,
+                functionpara={"CPS": "3", "Fill": "Omit"},
+                access_token=access_token,
+            )
+
+        frame = _retry(fetch_batch)
+        if frame.empty:
+            continue
+        normalized = frame.copy()
+        normalized["code"] = normalized["thscode"].astype(str).str.extract(
+            r"(\d{6})", expand=False
+        )
+        normalized["date"] = pd.to_datetime(
+            normalized["time"], errors="coerce"
+        ).dt.normalize()
+        for column in ["open", "close"]:
+            normalized[column] = pd.to_numeric(
+                normalized[column], errors="coerce"
+            )
+        frames.append(normalized[["code", "date", "open", "close"]])
+
+    if not frames:
+        raise RuntimeError("iFinD adjusted history returned no rows")
+    return (
+        pd.concat(frames, ignore_index=True)
+        .drop_duplicates(["code", "date"])
+        .reset_index(drop=True)
+    )
+
+
+def build_attribute_query(day) -> str:
+    """Build an explicitly dated iFinD point-in-time attribute query."""
+    day = pd.Timestamp(day).normalize()
+    prefix = f"{day.year}年{day.month}月{day.day}日"
+    return f"{prefix}A股，{prefix}流通市值，所属同花顺行业"
+
+
+def _empty_attributes() -> pd.DataFrame:
+    return pd.DataFrame({
+        "date": pd.Series(dtype="datetime64[ns]"),
+        "code": pd.Series(dtype="string"),
+        "name": pd.Series(dtype="string"),
+        "float_cap": pd.Series(dtype="float64"),
+        "industry": pd.Series(dtype="string"),
+    })
+
+
+def normalize_attributes(frame, day) -> pd.DataFrame:
+    """Normalize one dated smart-picking response without look-ahead."""
+    day = pd.Timestamp(day).normalize()
+    stamp = day.strftime("%Y%m%d")
+    cap_column = next(
+        (
+            column
+            for column in frame.columns
+            if stamp in str(column)
+            and "市值" in str(column)
+            and "限售" in str(column)
+        ),
+        None,
+    )
+    if cap_column is None:
+        raise ValueError(f"missing dated float cap for {stamp}")
+
+    result = pd.DataFrame({
+        "date": day,
+        "code": frame["股票代码"].astype(str).str.extract(
+            r"(\d{6})", expand=False
+        ),
+        "name": frame["股票简称"].astype(str),
+        "float_cap": pd.to_numeric(frame[cap_column], errors="coerce"),
+        "industry": frame["所属同花顺行业"].astype(str),
+    })
+    return (
+        result.dropna(subset=["code"])
+        .drop_duplicates("code", keep="first")
+        .reset_index(drop=True)
+    )
+
+
+def fetch_attributes(anchor_dates, access_token) -> pd.DataFrame:
+    """Fetch each unique point-in-time attribute anchor once."""
+    anchors = sorted({pd.Timestamp(day).normalize() for day in anchor_dates})
+    frames = []
+    for day in anchors:
+
+        def fetch_anchor(day=day):
+            return ths_http.smart_stock_picking(
+                build_attribute_query(day),
+                access_token=access_token,
+                timeout=90,
+            )
+
+        raw = _retry(fetch_anchor)
+        frames.append(normalize_attributes(raw, day))
+    if not frames:
+        return _empty_attributes()
+    return pd.concat(frames, ignore_index=True)
+
+
+def apply_attribute_filters(
+    eligible_pool,
+    attributes,
+    eval_dates,
+) -> pd.DataFrame:
+    """Apply fresh point-in-time ST and float-cap filters after ranking."""
+    if eligible_pool.empty or attributes.empty:
+        return eligible_pool.iloc[0:0].copy()
+
+    pool = eligible_pool.copy()
+    pool["date"] = pd.to_datetime(pool["date"]).dt.normalize()
+    attrs = attributes.copy()
+    attrs["date"] = pd.to_datetime(attrs["date"]).dt.normalize()
+    attrs["float_cap"] = pd.to_numeric(attrs["float_cap"], errors="coerce")
+
+    eval_index = pd.DatetimeIndex(eval_dates).normalize().drop_duplicates()
+    date_positions = {day: position for position, day in enumerate(eval_index)}
+    anchors = pd.DatetimeIndex(attrs["date"].dropna().unique()).sort_values()
+    rows = []
+
+    for day, members in pool.groupby("date", sort=True):
+        if day not in date_positions:
+            continue
+        prior = anchors[anchors <= day]
+        if prior.empty:
+            continue
+        anchor = prior[-1]
+        anchor_position = eval_index.searchsorted(anchor, side="left")
+        if date_positions[day] - anchor_position > 4:
+            continue
+
+        dated = (
+            attrs.loc[attrs["date"].eq(anchor)]
+            .drop_duplicates("code", keep="first")
+        )
+        names = dated["name"].astype("string").str.strip()
+        valid_name = ~names.str.match(r"^\*?ST", case=False, na=False)
+        valid_cap = np.isfinite(dated["float_cap"]) & dated["float_cap"].gt(0)
+        allowed = set(dated.loc[valid_name & valid_cap, "code"])
+        rows.append(members[members["code"].isin(allowed)])
+
+    if not rows:
+        return eligible_pool.iloc[0:0].copy()
+    return pd.concat(rows, ignore_index=True)
