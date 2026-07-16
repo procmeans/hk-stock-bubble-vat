@@ -1,6 +1,7 @@
 """Command-line orchestration for the six-month intraday validation."""
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -17,6 +18,7 @@ DEFAULT_DAILY = Path("alpha101/cache/ths_panel.pkl")
 DEFAULT_CACHE = Path("intraday/cache")
 DEFAULT_OUTPUT = Path("output/intraday_6m")
 PLAN_SCHEMA_VERSION = 1
+ADJUSTED_SCHEMA_VERSION = 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,6 +56,40 @@ def _normalize_day(value, name: str) -> pd.Timestamp:
     if pd.isna(day):
         raise ValueError(f"{name} must be a valid date")
     return day
+
+
+def _normalized_parameters(values, context: str) -> dict:
+    if isinstance(values, dict):
+        source = values
+    else:
+        source = {
+            "min_count": values.min_count,
+            "top_n": values.top_n,
+            "rebalance": values.rebalance,
+            "cost_bps": values.cost_bps,
+        }
+    expected = {"min_count", "top_n", "rebalance", "cost_bps"}
+    if set(source) != expected:
+        raise ValueError(
+            f"{context} parameters must contain exactly: "
+            + ", ".join(sorted(expected))
+        )
+    result = {
+        name: _positive_integer(source[name], f"{context} parameters {name}")
+        for name in ("min_count", "top_n", "rebalance")
+    }
+    try:
+        cost_bps = float(source["cost_bps"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{context} parameters cost_bps must be finite and nonnegative"
+        ) from exc
+    if not np.isfinite(cost_bps) or cost_bps < 0:
+        raise ValueError(
+            f"{context} parameters cost_bps must be finite and nonnegative"
+        )
+    result["cost_bps"] = cost_bps
+    return result
 
 
 def _atomic_write_json(payload: dict, path: Path) -> None:
@@ -101,13 +137,35 @@ def run_prepare(args):
     warmup = _normalize_day(args.warmup, "warmup")
     if not warmup <= start <= end:
         raise ValueError("dates must satisfy warmup <= start <= end")
+    parameters = _normalized_parameters(args, "CLI")
 
     raw = data.load_daily_raw(args.daily_cache)
     plan = data.prepare_universe(raw, start, end, top=top)
     if len(plan["eval_dates"]) == 0:
         raise ValueError("prepared plan has no evaluation dates")
+    if plan["eval_dates"][0] != start or plan["eval_dates"][-1] != end:
+        raise ValueError(
+            "prepared eval_dates boundaries must equal requested start/end"
+        )
     ranked_pool = _sorted_pool(plan["ranked_pool"])
     eligible_pool = _sorted_pool(plan["eligible_pool"])
+    if "date" not in raw:
+        raise ValueError("raw daily missing required column: date")
+    fetch_calendar = pd.DatetimeIndex(
+        data._normalize_dates(raw["date"], "raw daily").drop_duplicates()
+    ).sort_values()
+    fetch_dates = fetch_calendar[
+        (fetch_calendar >= warmup) & (fetch_calendar <= end)
+    ]
+    if (
+        len(fetch_dates) == 0
+        or fetch_dates[0] != warmup
+        or fetch_dates[-1] != end
+    ):
+        raise ValueError(
+            "prepared fetch_dates boundaries must equal requested warmup/end"
+        )
+    estimated_rows = len(plan["candidates"]) * len(fetch_dates) * 241
     payload = {
         "schema_version": PLAN_SCHEMA_VERSION,
         "start": start.strftime("%Y-%m-%d"),
@@ -115,16 +173,11 @@ def run_prepare(args):
         "warmup": warmup.strftime("%Y-%m-%d"),
         "top": top,
         "eval_dates": [day.strftime("%Y-%m-%d") for day in plan["eval_dates"]],
-        "fetch_dates": [day.strftime("%Y-%m-%d") for day in plan["fetch_dates"]],
+        "fetch_dates": [day.strftime("%Y-%m-%d") for day in fetch_dates],
         "candidates": list(plan["candidates"]),
-        "estimated_rows": int(plan["estimated_rows"]),
-        "estimated_cells": int(plan["estimated_cells"]),
-        "parameters": {
-            "min_count": int(args.min_count),
-            "top_n": int(args.top_n),
-            "rebalance": int(args.rebalance),
-            "cost_bps": float(args.cost_bps),
-        },
+        "estimated_rows": estimated_rows,
+        "estimated_cells": estimated_rows * 3,
+        "parameters": parameters,
     }
     cache = Path(args.cache)
     _atomic_write_parquet(ranked_pool, cache / "ranked_pool.parquet")
@@ -202,6 +255,7 @@ def _load_plan(root) -> dict:
         "candidates",
         "estimated_rows",
         "estimated_cells",
+        "parameters",
     }
     missing_keys = sorted(required_keys.difference(payload))
     if missing_keys:
@@ -217,10 +271,15 @@ def _load_plan(root) -> dict:
     top = _positive_integer(payload["top"], "plan top")
     eval_dates = _load_date_index(payload["eval_dates"], "eval_dates")
     fetch_dates = _load_date_index(payload["fetch_dates"], "fetch_dates")
-    if eval_dates.min() < start or eval_dates.max() > end:
-        raise ValueError("plan eval_dates fall outside start/end")
+    if eval_dates[0] != start or eval_dates[-1] != end:
+        raise ValueError("plan eval_dates boundaries must equal start/end dates")
+    if fetch_dates[0] != warmup or fetch_dates[-1] != end:
+        raise ValueError("plan fetch_dates boundaries must equal warmup/end dates")
+    if ((fetch_dates < warmup) | (fetch_dates > end)).any():
+        raise ValueError("plan fetch_dates fall outside warmup/end dates")
     if not eval_dates.isin(fetch_dates).all():
         raise ValueError("plan fetch_dates must contain every eval_date")
+    parameters = _normalized_parameters(payload["parameters"], "plan")
 
     candidates = payload["candidates"]
     if not isinstance(candidates, list):
@@ -276,6 +335,7 @@ def _load_plan(root) -> dict:
         "eval_dates": eval_dates,
         "fetch_dates": fetch_dates,
         "candidates": normalized_candidates,
+        "parameters": parameters,
         "ranked_pool": ranked_pool,
         "eligible_pool": eligible_pool,
     }
@@ -344,6 +404,118 @@ def _validate_adjusted(
         if not (np.isfinite(result[column]) & result[column].gt(0)).all():
             raise ValueError(f"adjusted daily cache contains invalid {column}")
     return result
+
+
+def _adjusted_content_hash(frame: pd.DataFrame) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"intraday-adjusted-daily-v1\n")
+    for row in frame[["date", "code", "open", "close"]].itertuples(
+        index=False,
+        name=None,
+    ):
+        day, code, open_price, close_price = row
+        canonical = (
+            f"{pd.Timestamp(day):%Y-%m-%d}\t{code}\t"
+            f"{float(open_price).hex()}\t{float(close_price).hex()}\n"
+        )
+        digest.update(canonical.encode("ascii"))
+    return digest.hexdigest()
+
+
+def _adjusted_manifest_payload(
+    frame: pd.DataFrame,
+    candidates: list[str],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> dict:
+    counts = frame.groupby("code", observed=True).size().reindex(candidates)
+    return {
+        "schema_version": ADJUSTED_SCHEMA_VERSION,
+        "request": {
+            "start": start.strftime("%Y-%m-%d"),
+            "end": end.strftime("%Y-%m-%d"),
+            "candidates": candidates,
+        },
+        "frame": {
+            "columns": ["date", "code", "open", "close"],
+            "row_count": len(frame),
+            "date_min": frame["date"].min().strftime("%Y-%m-%d"),
+            "date_max": frame["date"].max().strftime("%Y-%m-%d"),
+            "code_counts": {
+                code: int(counts.loc[code]) for code in candidates
+            },
+            "sha256": _adjusted_content_hash(frame),
+        },
+    }
+
+
+def _read_adjusted_cache(
+    parquet_path: Path,
+    manifest_path: Path,
+    candidates: list[str],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    *,
+    required: bool,
+):
+    if not parquet_path.is_file() or not manifest_path.is_file():
+        if required:
+            missing = []
+            if not parquet_path.is_file():
+                missing.append("adjusted_daily.parquet")
+            if not manifest_path.is_file():
+                missing.append("adjusted_daily.json")
+            raise FileNotFoundError(
+                "missing validation cache files: " + ", ".join(missing)
+            )
+        return None
+    try:
+        frame = pd.read_parquet(parquet_path)
+        normalized = _validate_adjusted(frame, candidates, start, end)
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        expected = _adjusted_manifest_payload(
+            normalized,
+            candidates,
+            start,
+            end,
+        )
+        if payload != expected:
+            raise ValueError("adjusted daily completion manifest mismatch")
+        return normalized
+    except Exception as exc:
+        if required:
+            raise ValueError(
+                "adjusted daily cache or completion manifest is corrupt"
+            ) from exc
+        return None
+
+
+def _publish_adjusted_cache(
+    frame: pd.DataFrame,
+    parquet_path: Path,
+    manifest_path: Path,
+    payload: dict,
+) -> None:
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_parquet = parquet_path.with_suffix(parquet_path.suffix + ".tmp")
+    temporary_manifest = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+    try:
+        frame.to_parquet(temporary_parquet, index=False)
+        temporary_manifest.write_text(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        temporary_parquet.replace(parquet_path)
+        temporary_manifest.replace(manifest_path)
+    finally:
+        temporary_parquet.unlink(missing_ok=True)
+        temporary_manifest.unlink(missing_ok=True)
 
 
 def _read_valid_cache(path: Path, validator, *args):
@@ -452,6 +624,88 @@ def _existing_coverage(path: Path) -> pd.DataFrame:
     return _normalize_coverage(frame, "coverage cache")
 
 
+def _validate_day_minute_coverage(
+    day: pd.Timestamp,
+    frame: pd.DataFrame,
+    statuses: dict[str, str],
+    indexed_coverage: pd.DataFrame,
+) -> None:
+    if frame.empty:
+        clean_counts = pd.Series(dtype="int64")
+    else:
+        clean_codes = data._normalize_code_series(
+            frame["code"],
+            "minute partition",
+        )
+        clean_counts = clean_codes.value_counts()
+    for code, status in statuses.items():
+        row = indexed_coverage.loc[(day, code)]
+        reason = row["reason"]
+        minute_count = int(row["minute_count"])
+        amount_error = float(row["amount_relative_error"])
+        clean_count = int(clean_counts.get(code, 0))
+
+        if status == "no_data":
+            if (
+                reason != "no_data"
+                or minute_count != 0
+                or clean_count != 0
+                or not np.isnan(amount_error)
+            ):
+                raise ValueError(
+                    f"minute coverage conflicts with no_data manifest: "
+                    f"{day.date()} {code}"
+                )
+            continue
+
+        if reason == "no_data":
+            raise ValueError(
+                f"minute coverage conflicts with returned manifest: "
+                f"{day.date()} {code}"
+            )
+        if np.isnan(amount_error) or amount_error < 0:
+            raise ValueError(
+                f"minute coverage has invalid amount error: {day.date()} {code}"
+            )
+        if reason == "ok":
+            if minute_count < 200:
+                raise ValueError(
+                    f"minute coverage marks too-short data as ok: "
+                    f"{day.date()} {code}"
+                )
+            if clean_count != minute_count:
+                raise ValueError(
+                    f"minute coverage count does not match clean parquet: "
+                    f"{day.date()} {code}"
+                )
+            if not np.isfinite(amount_error) or amount_error > 0.02:
+                raise ValueError(
+                    f"minute coverage ok amount error exceeds 2%: "
+                    f"{day.date()} {code}"
+                )
+        else:
+            if clean_count != 0:
+                raise ValueError(
+                    f"minute coverage failed code remains in clean parquet: "
+                    f"{day.date()} {code}"
+                )
+            if reason == "too_few_minutes" and minute_count >= 200:
+                raise ValueError(
+                    f"minute coverage too_few_minutes count is inconsistent: "
+                    f"{day.date()} {code}"
+                )
+            if reason in {"too_few_trades", "amount_mismatch"} and minute_count < 200:
+                raise ValueError(
+                    f"minute coverage {reason} count is inconsistent: "
+                    f"{day.date()} {code}"
+                )
+            if reason == "amount_mismatch" and amount_error <= 0.02:
+                raise ValueError(
+                    f"minute coverage amount_mismatch error is inconsistent: "
+                    f"{day.date()} {code}"
+                )
+
+
 def _complete_coverage(
     plan: dict,
     root: Path,
@@ -468,12 +722,18 @@ def _complete_coverage(
         combined = combined.drop_duplicates(["date", "code"], keep="last")
         combined = _normalize_coverage(combined, "merged coverage")
     rows = []
+    day_partitions = {}
     combined_keys = set(
         combined[["date", "code"]].itertuples(index=False, name=None)
     )
     expected_keys = set()
     for day in plan["fetch_dates"]:
-        _, statuses = _read_minute_partition(day, root, plan["candidates"])
+        frame, statuses = _read_minute_partition(
+            day,
+            root,
+            plan["candidates"],
+        )
+        day_partitions[day] = (frame, statuses)
         for code, status in statuses.items():
             key = (day, code)
             expected_keys.add(key)
@@ -504,12 +764,33 @@ def _complete_coverage(
     )
     if actual_keys != expected_keys:
         raise ValueError("coverage does not exactly cover the prepared plan")
+    indexed = combined.set_index(["date", "code"])
+    for day, (frame, statuses) in day_partitions.items():
+        _validate_day_minute_coverage(
+            day,
+            frame,
+            statuses,
+            indexed,
+        )
     return combined
+
+
+def _assert_cli_matches_plan(args, plan: dict) -> None:
+    for name in ("start", "end", "warmup"):
+        if _normalize_day(getattr(args, name), f"CLI {name}") != plan[name]:
+            raise ValueError(f"CLI {name} does not match prepared plan")
+    if args.top != plan["top"]:
+        raise ValueError("CLI top does not match prepared plan")
+    parameters = _normalized_parameters(args, "CLI")
+    for name, expected in plan["parameters"].items():
+        if parameters[name] != expected:
+            raise ValueError(f"CLI {name} does not match prepared plan")
 
 
 def run_fetch(args):
     """Resume the immutable prepared plan with one access token per run."""
     plan = _load_plan(args.cache)
+    _assert_cli_matches_plan(args, plan)
     raw = data.load_daily_raw(args.daily_cache)
     token = ths_http.get_access_token()
     root = Path(args.cache)
@@ -531,12 +812,14 @@ def run_fetch(args):
         _atomic_write_parquet(attributes, attributes_path)
 
     adjusted_path = root / "adjusted_daily.parquet"
-    adjusted = _read_valid_cache(
+    adjusted_manifest_path = root / "adjusted_daily.json"
+    adjusted = _read_adjusted_cache(
         adjusted_path,
-        _validate_adjusted,
+        adjusted_manifest_path,
         plan["candidates"],
         plan["warmup"],
         plan["end"],
+        required=False,
     )
     if adjusted is None:
         adjusted = _validate_adjusted(
@@ -550,7 +833,18 @@ def run_fetch(args):
             plan["warmup"],
             plan["end"],
         )
-        _atomic_write_parquet(adjusted, adjusted_path)
+        adjusted_manifest = _adjusted_manifest_payload(
+            adjusted,
+            plan["candidates"],
+            plan["warmup"],
+            plan["end"],
+        )
+        _publish_adjusted_cache(
+            adjusted,
+            adjusted_path,
+            adjusted_manifest_path,
+            adjusted_manifest,
+        )
 
     coverage_path = root / "data_coverage.parquet"
     previous = _existing_coverage(coverage_path)
@@ -571,6 +865,7 @@ def _load_validation_caches(args, plan: dict):
     paths = {
         "attributes": root / "attributes.parquet",
         "adjusted_daily": root / "adjusted_daily.parquet",
+        "adjusted_daily_manifest": root / "adjusted_daily.json",
         "data_coverage": root / "data_coverage.parquet",
     }
     missing = [name for name, path in paths.items() if not path.is_file()]
@@ -588,15 +883,13 @@ def _load_validation_caches(args, plan: dict):
         anchors,
         plan["candidates"],
     )
-    try:
-        adjusted_frame = pd.read_parquet(paths["adjusted_daily"])
-    except Exception as exc:
-        raise ValueError("adjusted daily cache is unreadable or corrupt") from exc
-    adjusted = _validate_adjusted(
-        adjusted_frame,
+    adjusted = _read_adjusted_cache(
+        paths["adjusted_daily"],
+        paths["adjusted_daily_manifest"],
         plan["candidates"],
         plan["warmup"],
         plan["end"],
+        required=True,
     )
     coverage = _existing_coverage(paths["data_coverage"])
     return attributes, adjusted, coverage
@@ -626,23 +919,12 @@ def _validate_coverage_and_partitions(
             plan["candidates"],
         )
         partitions.append((day, frame))
-        for code, status in statuses.items():
-            row = indexed.loc[(day, code)]
-            reason = row["reason"]
-            minute_count = int(row["minute_count"])
-            if status == "no_data":
-                if reason != "no_data" or minute_count != 0:
-                    raise ValueError(
-                        "coverage quality conflicts with no_data manifest"
-                    )
-            elif reason == "no_data":
-                raise ValueError(
-                    "coverage quality conflicts with returned manifest"
-                )
-            if reason == "ok" and minute_count < 200:
-                raise ValueError("coverage marks too-short minute data as ok")
-            if reason == "too_few_minutes" and minute_count >= 200:
-                raise ValueError("coverage too_few_minutes count is inconsistent")
+        _validate_day_minute_coverage(
+            day,
+            frame,
+            statuses,
+            indexed,
+        )
     return partitions
 
 
@@ -716,11 +998,7 @@ def _threshold_disclosures(
 def run_validate(args):
     """Read the completed cache only, evaluate it, and write report outputs."""
     plan = _load_plan(args.cache)
-    for name in ("start", "end", "warmup"):
-        if _normalize_day(getattr(args, name), name) != plan[name]:
-            raise ValueError(f"CLI {name} does not match prepared plan")
-    if args.top != plan["top"]:
-        raise ValueError("CLI top does not match prepared plan")
+    _assert_cli_matches_plan(args, plan)
 
     attributes, adjusted, minute_coverage = _load_validation_caches(args, plan)
     partitions = _validate_coverage_and_partitions(

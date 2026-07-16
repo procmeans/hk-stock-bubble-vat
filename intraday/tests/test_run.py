@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import intraday.run as intraday_run
 from intraday import data as intraday_data
 from intraday.report import write_outputs
 from intraday.run import (
@@ -112,6 +113,55 @@ def test_parser_defaults_are_pinned():
     assert args.output == Path("output/intraday_6m")
 
 
+def test_all_four_subcommands_share_identical_defaults():
+    parsed = {
+        command: vars(build_parser().parse_args([command]))
+        for command in ("prepare", "fetch", "validate", "all")
+    }
+    common = {
+        command: {key: value for key, value in values.items() if key != "command"}
+        for command, values in parsed.items()
+    }
+
+    assert common["prepare"] == common["fetch"]
+    assert common["prepare"] == common["validate"]
+    assert common["prepare"] == common["all"]
+
+
+def test_main_all_runs_strict_order_and_propagates_failure(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        intraday_run,
+        "run_prepare",
+        lambda args: calls.append("prepare"),
+    )
+    monkeypatch.setattr(
+        intraday_run,
+        "run_fetch",
+        lambda args: calls.append("fetch"),
+    )
+    monkeypatch.setattr(
+        intraday_run,
+        "run_validate",
+        lambda args: calls.append("validate"),
+    )
+
+    intraday_run.main(["all"])
+
+    assert calls == ["prepare", "fetch", "validate"]
+
+    calls.clear()
+
+    def fail_fetch(args):
+        calls.append("fetch")
+        raise RuntimeError("fetch stopped")
+
+    monkeypatch.setattr(intraday_run, "run_fetch", fail_fetch)
+    with pytest.raises(RuntimeError, match="fetch stopped"):
+        intraday_run.main(["all"])
+    assert calls == ["prepare", "fetch"]
+
+
 def _daily_frame(dates, codes=("000001", "000002")):
     return pd.DataFrame(
         [
@@ -164,8 +214,30 @@ def test_prepare_writes_deterministic_atomic_validated_plan(
     loaded = _load_plan(args.cache)
     assert loaded["warmup"] == pd.Timestamp(dates[0])
     assert loaded["eval_dates"].equals(dates[25:])
+    assert loaded["eval_dates"][[0, -1]].tolist() == [dates[25], dates[-1]]
+    assert loaded["fetch_dates"][[0, -1]].tolist() == [dates[0], dates[-1]]
     assert loaded["estimated_cells"] == loaded["estimated_rows"] * 3
     assert loaded["ranked_pool"].groupby("date").size().le(2).all()
+
+
+def test_prepare_fixed_default_date_boundaries_are_valid(tmp_path, monkeypatch):
+    dates = pd.bdate_range("2025-12-11", "2026-07-10")
+    raw = _daily_frame(dates)
+    args = build_parser().parse_args(
+        ["prepare", "--cache", str(tmp_path), "--top", "2"]
+    )
+    monkeypatch.setattr("intraday.data.load_daily_raw", lambda _: raw)
+
+    plan = run_prepare(args)
+
+    assert plan["eval_dates"][[0, -1]].tolist() == [
+        pd.Timestamp("2026-01-12"),
+        pd.Timestamp("2026-07-10"),
+    ]
+    assert plan["fetch_dates"][[0, -1]].tolist() == [
+        pd.Timestamp("2025-12-11"),
+        pd.Timestamp("2026-07-10"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -258,6 +330,100 @@ def test_load_plan_rejects_ranked_pool_over_top_quota(tmp_path, monkeypatch):
         _load_plan(tmp_path)
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ["drop_eval_start", "drop_fetch_warmup", "prepend_history", "append_future"],
+)
+def test_load_plan_requires_exact_declared_date_boundaries(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    args, _, _ = _prepared_fetch_case(tmp_path, monkeypatch)
+    plan_path = args.cache / "plan.json"
+    payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    if mutation == "drop_eval_start":
+        payload["eval_dates"] = payload["eval_dates"][1:]
+    elif mutation == "drop_fetch_warmup":
+        payload["fetch_dates"] = payload["fetch_dates"][1:]
+    elif mutation == "prepend_history":
+        prior = pd.Timestamp(payload["warmup"]) - pd.Timedelta(days=1)
+        payload["fetch_dates"].insert(0, prior.strftime("%Y-%m-%d"))
+    else:
+        future = pd.Timestamp(payload["end"]) + pd.Timedelta(days=1)
+        payload["fetch_dates"].append(future.strftime("%Y-%m-%d"))
+    payload["estimated_rows"] = (
+        len(payload["candidates"]) * len(payload["fetch_dates"]) * 241
+    )
+    payload["estimated_cells"] = payload["estimated_rows"] * 3
+    plan_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="dates"):
+        _load_plan(args.cache)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "min_count",
+        "top_n",
+        "rebalance",
+        "cost_bps",
+    ],
+)
+def test_load_plan_requires_valid_pinned_parameters(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    args, _, _ = _prepared_fetch_case(tmp_path, monkeypatch)
+    plan_path = args.cache / "plan.json"
+    payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    if mutation == "missing":
+        del payload["parameters"]
+    elif mutation == "cost_bps":
+        payload["parameters"][mutation] = float("nan")
+    else:
+        payload["parameters"][mutation] = 0
+    plan_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="parameters"):
+        _load_plan(args.cache)
+
+
+@pytest.mark.parametrize("runner", [run_fetch, run_validate])
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("start", "2025-12-30"),
+        ("end", "2026-01-01"),
+        ("warmup", "2025-12-02"),
+        ("top", 3),
+        ("min_count", 399),
+        ("top_n", 49),
+        ("rebalance", 3),
+        ("cost_bps", 10.0),
+    ],
+)
+def test_fetch_and_validate_reject_every_cli_plan_parameter_drift(
+    tmp_path,
+    monkeypatch,
+    runner,
+    name,
+    value,
+):
+    args, _, _ = _prepared_fetch_case(tmp_path, monkeypatch)
+    setattr(args, name, value)
+    monkeypatch.setattr(
+        "alpha101.ths_http.get_access_token",
+        lambda: pytest.fail("parameter drift must fail before token acquisition"),
+    )
+
+    with pytest.raises(ValueError, match=rf"CLI {name}"):
+        runner(args)
+
+
 def _prepared_fetch_case(tmp_path, monkeypatch):
     dates = pd.bdate_range("2025-12-01", periods=25)
     raw = _daily_frame(dates)
@@ -290,6 +456,146 @@ def _empty_minute_frame():
             for name, dtype in intraday_data.MINUTE_DTYPES.items()
         }
     )
+
+
+def _install_no_data_fetch_fakes(
+    monkeypatch,
+    plan,
+    dates,
+    adjusted_calls,
+):
+    monkeypatch.setattr("alpha101.ths_http.get_access_token", lambda: "token")
+    monkeypatch.setattr(
+        "intraday.data.fetch_attributes",
+        lambda anchors, token: pd.DataFrame(
+            [
+                {
+                    "date": day,
+                    "code": code,
+                    "name": f"Company {code}",
+                    "float_cap": 1_000_000.0,
+                    "industry": "I",
+                }
+                for day in anchors
+                for code in plan["candidates"]
+            ]
+        ),
+    )
+
+    def fetch_adjusted(codes, start, end, token):
+        adjusted_calls.append("called")
+        return pd.DataFrame(
+            [
+                {
+                    "date": day,
+                    "code": code,
+                    "open": 10.0 + code_index,
+                    "close": 10.0 + code_index,
+                }
+                for day in dates
+                for code_index, code in enumerate(codes)
+                if not (day == dates[1] and code_index == 0)
+            ]
+        )
+
+    def fetch_minutes(fetch_plan, raw, root, token):
+        for day in fetch_plan["fetch_dates"]:
+            if not intraday_data.day_complete(day, fetch_plan["candidates"], root):
+                intraday_data.write_day_partition(
+                    _empty_minute_frame(),
+                    {code: "no_data" for code in fetch_plan["candidates"]},
+                    day,
+                    root,
+                )
+        return pd.DataFrame(columns=intraday_data.COVERAGE_COLUMNS)
+
+    monkeypatch.setattr("intraday.data.fetch_adjusted_daily", fetch_adjusted)
+    monkeypatch.setattr("intraday.data.fetch_minute_partitions", fetch_minutes)
+
+
+def test_fetch_reuses_adjusted_only_with_matching_completion_manifest(
+    tmp_path,
+    monkeypatch,
+):
+    args, _, dates = _prepared_fetch_case(tmp_path, monkeypatch)
+    plan = _load_plan(args.cache)
+    adjusted_calls = []
+    _install_no_data_fetch_fakes(
+        monkeypatch,
+        plan,
+        dates,
+        adjusted_calls,
+    )
+
+    run_fetch(args)
+
+    parquet_path = args.cache / "adjusted_daily.parquet"
+    manifest_path = args.cache / "adjusted_daily.json"
+    assert manifest_path.is_file()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 1
+    assert manifest["request"] == {
+        "start": plan["warmup"].strftime("%Y-%m-%d"),
+        "end": plan["end"].strftime("%Y-%m-%d"),
+        "candidates": plan["candidates"],
+    }
+    assert len(manifest["frame"]["sha256"]) == 64
+    assert manifest["frame"]["row_count"] < len(dates) * len(plan["candidates"])
+    assert adjusted_calls == ["called"]
+
+    partial = pd.read_parquet(parquet_path).groupby("code").nth(0).reset_index()
+    partial.to_parquet(parquet_path, index=False)
+    manifest_path.unlink()
+    run_fetch(args)
+    assert adjusted_calls == ["called", "called"]
+
+    old_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    old_manifest["schema_version"] = 0
+    manifest_path.write_text(json.dumps(old_manifest), encoding="utf-8")
+    run_fetch(args)
+    assert adjusted_calls == ["called", "called", "called"]
+
+    tampered = pd.read_parquet(parquet_path)
+    tampered.loc[tampered.index[0], "open"] += 1.0
+    tampered.to_parquet(parquet_path, index=False)
+    run_fetch(args)
+    assert adjusted_calls == ["called", "called", "called", "called"]
+
+    run_fetch(args)
+    assert adjusted_calls == ["called", "called", "called", "called"]
+
+
+def test_adjusted_manifest_is_published_last_and_failure_is_not_reusable(
+    tmp_path,
+    monkeypatch,
+):
+    args, _, dates = _prepared_fetch_case(tmp_path, monkeypatch)
+    plan = _load_plan(args.cache)
+    adjusted_calls = []
+    _install_no_data_fetch_fakes(
+        monkeypatch,
+        plan,
+        dates,
+        adjusted_calls,
+    )
+    manifest_path = args.cache / "adjusted_daily.json"
+    real_replace = Path.replace
+
+    def fail_manifest_publish(path, target):
+        if Path(target) == manifest_path:
+            raise OSError("manifest publish failure")
+        return real_replace(path, target)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(Path, "replace", fail_manifest_publish)
+        with pytest.raises(OSError, match="manifest publish failure"):
+            run_fetch(args)
+
+    assert (args.cache / "adjusted_daily.parquet").is_file()
+    assert not manifest_path.exists()
+    assert not list(args.cache.rglob("*.tmp"))
+    run_fetch(args)
+    assert adjusted_calls == ["called", "called"]
 
 
 def test_fetch_uses_one_token_and_atomically_resumes_complete_caches(
@@ -353,7 +659,7 @@ def test_fetch_uses_one_token_and_atomically_resumes_complete_caches(
                         "date": fetch_plan["fetch_dates"][0],
                         "code": fetch_plan["candidates"][0],
                         "minute_count": 0,
-                        "amount_relative_error": 0.123,
+                        "amount_relative_error": np.nan,
                         "reason": "no_data",
                     }
                 ]
@@ -383,7 +689,7 @@ def test_fetch_uses_one_token_and_atomically_resumes_complete_caches(
         & resumed["code"].eq(plan["candidates"][0]),
         "amount_relative_error",
     ]
-    assert updated.iloc[0] == pytest.approx(0.123)
+    assert pd.isna(updated.iloc[0])
 
 
 def test_fetch_does_not_accept_corrupt_complete_minute_partition(
@@ -624,9 +930,20 @@ def _write_offline_validation_case(tmp_path):
     raw = pd.DataFrame(daily_rows)
     daily_path = tmp_path / "daily.pkl"
     raw.to_pickle(daily_path)
-    pd.DataFrame(adjusted_rows).to_parquet(
+    adjusted_frame = pd.DataFrame(adjusted_rows)
+    adjusted_frame.to_parquet(
         cache / "adjusted_daily.parquet",
         index=False,
+    )
+    adjusted_manifest = intraday_run._adjusted_manifest_payload(
+        adjusted_frame,
+        codes,
+        dates[0],
+        dates[-1],
+    )
+    (cache / "adjusted_daily.json").write_text(
+        json.dumps(adjusted_manifest),
+        encoding="utf-8",
     )
     pd.DataFrame(coverage_rows).to_parquet(
         cache / "data_coverage.parquet",
@@ -733,6 +1050,11 @@ def test_validate_rejects_each_corrupt_cache_layer_read_only(tmp_path):
             b"bad coverage",
             "coverage cache",
         ),
+        (
+            args.cache / "adjusted_daily.json",
+            b"{}",
+            "adjusted daily cache",
+        ),
         (manifest, b"{}", "minute manifest"),
     ]
 
@@ -744,3 +1066,109 @@ def test_validate_rejects_each_corrupt_cache_layer_read_only(tmp_path):
         assert path.read_bytes() == corrupt
         path.write_bytes(original)
     assert not args.output.exists()
+
+
+def test_validate_requires_adjusted_completion_manifest_read_only(tmp_path):
+    args, _, _ = _write_offline_validation_case(tmp_path)
+    manifest_path = args.cache / "adjusted_daily.json"
+    manifest_path.unlink()
+    before = {
+        path.relative_to(args.cache): path.read_bytes()
+        for path in args.cache.rglob("*")
+        if path.is_file()
+    }
+
+    with pytest.raises(FileNotFoundError, match="adjusted_daily_manifest"):
+        run_validate(args)
+
+    after = {
+        path.relative_to(args.cache): path.read_bytes()
+        for path in args.cache.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "empty_ok_partition",
+        "missing_ok_code",
+        "fake_ok_count",
+        "failed_has_rows",
+        "no_data_has_rows",
+        "no_data_nonzero_count",
+    ],
+)
+def test_validate_rejects_minute_partition_coverage_inconsistency(
+    tmp_path,
+    case,
+):
+    args, dates, codes = _write_offline_validation_case(tmp_path)
+    parquet_path, manifest_path = intraday_data._day_paths(dates[0], args.cache)
+    coverage_path = args.cache / "data_coverage.parquet"
+    minute = pd.read_parquet(parquet_path)
+    coverage = pd.read_parquet(coverage_path)
+    first = coverage["date"].eq(dates[0]) & coverage["code"].eq(codes[0])
+
+    if case == "empty_ok_partition":
+        minute = minute.iloc[0:0]
+    elif case == "missing_ok_code":
+        minute = minute.loc[minute["code"].ne(codes[0])]
+    elif case == "fake_ok_count":
+        coverage.loc[first, "minute_count"] = 201
+    elif case == "failed_has_rows":
+        coverage.loc[first, "reason"] = "too_few_trades"
+    else:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["statuses"][codes[0]] = "no_data"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        coverage.loc[
+            first,
+            ["reason", "minute_count", "amount_relative_error"],
+        ] = ["no_data", 0, np.nan]
+        if case == "no_data_nonzero_count":
+            coverage.loc[first, "minute_count"] = 1
+            minute = minute.loc[minute["code"].ne(codes[0])]
+
+    minute.to_parquet(parquet_path, index=False)
+    coverage.to_parquet(coverage_path, index=False)
+
+    with pytest.raises(ValueError, match=r"minute (coverage|partition)"):
+        run_validate(args)
+
+
+@pytest.mark.parametrize(
+    ("reason", "count", "amount_error"),
+    [
+        ("too_few_trades", 199, 0.0),
+        ("amount_mismatch", 199, 0.03),
+        ("ok", 200, 0.03),
+        ("amount_mismatch", 200, 0.01),
+        ("ok", 200, np.nan),
+    ],
+)
+def test_validate_rejects_impossible_coverage_reason_thresholds(
+    tmp_path,
+    reason,
+    count,
+    amount_error,
+):
+    args, dates, codes = _write_offline_validation_case(tmp_path)
+    parquet_path, _ = intraday_data._day_paths(dates[0], args.cache)
+    coverage_path = args.cache / "data_coverage.parquet"
+    minute = pd.read_parquet(parquet_path)
+    coverage = pd.read_parquet(coverage_path)
+    first = coverage["date"].eq(dates[0]) & coverage["code"].eq(codes[0])
+    coverage.loc[first, ["reason", "minute_count", "amount_relative_error"]] = [
+        reason,
+        count,
+        amount_error,
+    ]
+    if reason != "ok":
+        minute = minute.loc[minute["code"].ne(codes[0])]
+    minute.to_parquet(parquet_path, index=False)
+    coverage.to_parquet(coverage_path, index=False)
+
+    with pytest.raises(ValueError, match="minute coverage"):
+        run_validate(args)
