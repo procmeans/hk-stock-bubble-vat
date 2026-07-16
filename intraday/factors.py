@@ -1,11 +1,14 @@
 """Compress minute partitions into rolling daily factor panels."""
 
+import re
+
 import numpy as np
 import pandas as pd
 
 
 _DAY_FACTOR_KEYS = ("rskew_day", "cpv_day", "smart_q_day")
 _MINUTE_COLUMNS = ("time", "close", "volume", "amount")
+_CODE_PATTERN = re.compile(r"^[0-9]{6}$")
 
 
 def _nan_day_factors() -> dict[str, float]:
@@ -21,13 +24,22 @@ def minute_day_factors(frame: pd.DataFrame) -> dict[str, float]:
         raise ValueError(
             f"minute frame missing required columns: {', '.join(missing)}"
         )
-    numeric = frame[["close", "volume", "amount"]].to_numpy(dtype=float)
+    data = frame.copy()
+    data["time"] = pd.to_datetime(
+        data["time"], errors="coerce", format="mixed"
+    )
+    if data["time"].isna().any():
+        raise ValueError("minute frame contains invalid time")
+    if data["time"].duplicated().any():
+        raise ValueError("minute frame contains duplicate time")
+
+    numeric = data[["close", "volume", "amount"]].to_numpy(dtype=float)
     if not np.isfinite(numeric).all():
         raise ValueError("minute frame contains non-finite values")
-    if (frame["close"] <= 0).any():
+    if (data["close"] <= 0).any():
         raise ValueError("minute frame contains non-positive close values")
 
-    data = frame.sort_values("time").copy()
+    data = data.sort_values("time", kind="mergesort")
     data["r"] = np.log(data["close"] / data["close"].shift(1))
 
     returns = data["r"].dropna()
@@ -59,7 +71,7 @@ def minute_day_factors(frame: pd.DataFrame) -> dict[str, float]:
     if ranked.empty or ranked["volume"].sum() <= 0:
         smart_q = np.nan
     else:
-        target = 0.20 * ranked["volume"].sum()
+        target = 0.20 * traded["volume"].sum()
         prior_volume = ranked["volume"].cumsum().shift(fill_value=0)
         smart = ranked[prior_volume < target]
         all_amount = traded["amount"].sum()
@@ -85,17 +97,48 @@ def factor_panels(
     min_periods: int = 15,
 ) -> dict[str, pd.DataFrame]:
     """Aggregate stock-day factors and apply the requested rolling windows."""
+    parsed_dates = pd.to_datetime(
+        list(dates), errors="coerce", format="mixed"
+    )
+    index = pd.DatetimeIndex(parsed_dates)
+    if index.isna().any():
+        raise ValueError("dates contains invalid date")
+    index = index.normalize()
+    if index.has_duplicates:
+        raise ValueError("dates must be unique")
+    if not index.is_monotonic_increasing:
+        raise ValueError("dates must be increasing")
+
+    code_values = list(codes)
+    if not all(
+        isinstance(code, str) and _CODE_PATTERN.fullmatch(code)
+        for code in code_values
+    ):
+        raise ValueError("codes must contain six-digit strings")
+    columns = pd.Index(code_values)
+    if columns.has_duplicates:
+        raise ValueError("codes must be unique")
+
     rows = []
+    seen_keys = set()
     for day, frame in partitions:
+        parsed_day = pd.to_datetime(day, errors="coerce", format="mixed")
+        if pd.isna(parsed_day):
+            raise ValueError("partition contains invalid date")
+        partition_day = pd.Timestamp(parsed_day).normalize()
+        if "code" not in frame:
+            raise ValueError("partition missing required column: code")
         for code, group in frame.groupby("code", sort=True):
+            key = (partition_day, code)
+            if key in seen_keys:
+                raise ValueError("partitions contain duplicate date/code")
+            seen_keys.add(key)
             rows.append({
-                "date": pd.Timestamp(day),
+                "date": partition_day,
                 "code": code,
                 **minute_day_factors(group),
             })
 
-    index = pd.DatetimeIndex(dates)
-    columns = pd.Index(codes)
     if rows:
         daily = pd.DataFrame(rows)
 

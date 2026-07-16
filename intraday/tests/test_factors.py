@@ -64,12 +64,29 @@ def test_smart_money_includes_threshold_crossing_minute():
     assert result["smart_q_day"] == pytest.approx(expected)
 
 
-def test_smart_money_stops_when_selected_volume_exactly_reaches_target():
+def test_smart_money_target_counts_first_positive_volume_minute():
     frame = pd.DataFrame({
         "time": pd.date_range("2026-01-12 09:30", periods=3, freq="min"),
         "close": [10.0, 11.0, 11.1],
         "volume": [1.0, 20.0, 80.0],
         "amount": [10.0, 220.0, 888.0],
+    })
+
+    result = minute_day_factors(frame)
+
+    expected_smart_vwap = (220.0 + 888.0) / (20.0 + 80.0)
+    expected_all_vwap = frame["amount"].sum() / frame["volume"].sum()
+    assert result["smart_q_day"] == pytest.approx(
+        expected_smart_vwap / expected_all_vwap
+    )
+
+
+def test_smart_money_stops_when_traded_volume_exactly_reaches_target():
+    frame = pd.DataFrame({
+        "time": pd.date_range("2026-01-12 09:30", periods=3, freq="min"),
+        "close": [10.0, 11.0, 11.1],
+        "volume": [0.0, 20.0, 80.0],
+        "amount": [0.0, 220.0, 888.0],
     })
 
     result = minute_day_factors(frame)
@@ -84,14 +101,14 @@ def test_smart_money_breaks_smartness_ties_by_earliest_time():
     chronological = pd.DataFrame({
         "time": times,
         "close": close,
-        "volume": np.ones(6),
-        "amount": close,
+        "volume": [0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        "amount": [0.0, *close[1:]],
     })
     shuffled = chronological.iloc[[0, 5, 4, 3, 2, 1]].reset_index(drop=True)
 
     result = minute_day_factors(shuffled)
 
-    expected_all_vwap = chronological["amount"].sum() / 6.0
+    expected_all_vwap = chronological["amount"].sum() / 5.0
     assert result["smart_q_day"] == pytest.approx(close[1] / expected_all_vwap)
 
 
@@ -148,6 +165,49 @@ def test_minute_day_factors_rejects_non_finite_inputs(column, value):
         minute_day_factors(frame)
 
 
+def test_minute_day_factors_parses_strings_and_sorts_by_real_time():
+    chronological = pd.DataFrame({
+        "time": pd.to_datetime([
+            "2026-01-12 09:30",
+            "2026-01-12 09:31",
+            "2026-01-12 10:00",
+        ]),
+        "close": [10.0, 12.0, 11.0],
+        "volume": [10.0, 20.0, 30.0],
+        "amount": [100.0, 240.0, 330.0],
+    })
+    string_shuffled = chronological.iloc[[2, 0, 1]].copy()
+    string_shuffled["time"] = [
+        "2026-01-12 10:00",
+        "2026-01-12 9:30",
+        "2026-01-12 9:31",
+    ]
+
+    result = minute_day_factors(string_shuffled)
+    expected = minute_day_factors(chronological)
+
+    assert result == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    ("times", "message"),
+    [
+        (["not-a-time", "2026-01-12 09:31"], "invalid time"),
+        (["2026-01-12 09:30", "2026-01-12 09:30"], "duplicate time"),
+    ],
+)
+def test_minute_day_factors_rejects_invalid_or_duplicate_times(times, message):
+    frame = pd.DataFrame({
+        "time": times,
+        "close": [10.0, 11.0],
+        "volume": [10.0, 20.0],
+        "amount": [100.0, 220.0],
+    })
+
+    with pytest.raises(ValueError, match=message):
+        minute_day_factors(frame)
+
+
 def test_factor_panels_exposes_only_bound_output_keys():
     result = factor_panels([], ["000001"], pd.DatetimeIndex([]))
 
@@ -164,6 +224,77 @@ def test_factor_panels_returns_aligned_empty_panels_for_empty_partitions():
         assert panel.index.equals(dates)
         assert panel.columns.tolist() == codes
         assert panel.isna().all().all()
+
+
+def test_factor_panels_normalizes_dates_and_partition_days():
+    day = pd.Timestamp("2026-01-05")
+    frame = _minute_frame(day).assign(code="000001")
+
+    result = factor_panels(
+        [("2026-01-05 16:00", frame)],
+        ["000001"],
+        ["2026-01-05 09:00"],
+        window=1,
+        min_periods=1,
+    )
+
+    assert result["rskew"].index.equals(pd.DatetimeIndex([day]))
+    assert result["rskew"].loc[day, "000001"] == pytest.approx(
+        minute_day_factors(frame)["rskew_day"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("dates", "message"),
+    [
+        (["not-a-date"], "invalid date"),
+        (
+            ["2026-01-05 09:00", "2026-01-05 16:00"],
+            "dates must be unique",
+        ),
+        (["2026-01-06", "2026-01-05"], "dates must be increasing"),
+    ],
+)
+def test_factor_panels_rejects_invalid_duplicate_or_unsorted_dates(
+    dates,
+    message,
+):
+    with pytest.raises(ValueError, match=message):
+        factor_panels([], ["000001"], dates)
+
+
+@pytest.mark.parametrize(
+    ("codes", "message"),
+    [
+        (["000001", "000001"], "codes must be unique"),
+        (["000001", 2], "six-digit strings"),
+        (["000001", "2"], "six-digit strings"),
+    ],
+)
+def test_factor_panels_rejects_duplicate_or_non_normalized_codes(codes, message):
+    with pytest.raises(ValueError, match=message):
+        factor_panels([], codes, pd.DatetimeIndex([]))
+
+
+def test_factor_panels_rejects_duplicate_partition_date_code_keys():
+    day = pd.Timestamp("2026-01-05")
+    frame = _minute_frame(day).assign(code="000001")
+
+    with pytest.raises(ValueError, match="duplicate date/code"):
+        factor_panels(
+            [(day, frame), (day + pd.Timedelta(hours=16), frame)],
+            ["000001"],
+            [day],
+            window=1,
+            min_periods=1,
+        )
+
+
+def test_factor_panels_rejects_partition_without_code_column():
+    day = pd.Timestamp("2026-01-05")
+
+    with pytest.raises(ValueError, match="missing required column: code"):
+        factor_panels([(day, _minute_frame(day))], ["000001"], [day])
 
 
 def test_factor_panels_aligns_missing_code_days_before_rolling():
