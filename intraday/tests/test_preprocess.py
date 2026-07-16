@@ -87,6 +87,23 @@ def test_neutralize_returns_nan_when_valid_count_is_too_small():
     assert result.isna().all()
 
 
+@pytest.mark.parametrize("argument", ["values", "float_cap", "industry"])
+def test_neutralize_requires_unique_input_indexes(argument):
+    index = list("ABCDEF")
+    inputs = {
+        "values": pd.Series([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], index=index),
+        "float_cap": pd.Series(
+            [10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+            index=index,
+        ),
+        "industry": pd.Series(["x", "x", "x", "y", "y", "y"], index=index),
+    }
+    inputs[argument].index = ["A", "A", "C", "D", "E", "F"]
+
+    with pytest.raises(ValueError, match=f"{argument} index must be unique"):
+        neutralize_day(**inputs, min_count=6)
+
+
 def test_neutralize_excludes_invalid_caps_and_missing_industries():
     index = list("ABCDEFGHIJK")
     cap = pd.Series(
@@ -175,6 +192,25 @@ def test_neutralize_invalidates_numerically_zero_residual_variance():
     assert result.isna().all()
 
 
+def test_neutralize_invalidates_ill_conditioned_exact_fit_residual():
+    index = list("ABCDEF")
+    log_cap = pd.Series(
+        30.0 + np.arange(len(index)) * 1e-4,
+        index=index,
+    )
+    industry = pd.Series(["x", "x", "x", "y", "y", "y"], index=index)
+    values = 2.0 * log_cap + industry.map({"x": 0.0, "y": 1.0})
+
+    result = neutralize_day(
+        values,
+        np.exp(log_cap),
+        industry,
+        min_count=6,
+    )
+
+    assert result.isna().all()
+
+
 def test_factor_directions_are_fixed_and_negative():
     assert DIRECTIONS == {
         "rskew": -1.0,
@@ -208,6 +244,28 @@ def test_compose_requires_all_four_bound_factor_keys():
             "cpv_mean": frame,
             "cpv_std": frame,
         })
+
+
+@pytest.mark.parametrize("factor_name", list(DIRECTIONS))
+@pytest.mark.parametrize("axis", ["index", "columns"])
+def test_compose_requires_unique_factor_axes(factor_name, axis):
+    dates = pd.to_datetime(["2026-01-05", "2026-01-06"])
+    frame = pd.DataFrame(
+        [[1.0, -1.0], [-1.0, 1.0]],
+        index=dates,
+        columns=["A", "B"],
+    )
+    processed = {name: frame.copy() for name in DIRECTIONS}
+    if axis == "index":
+        processed[factor_name].index = [dates[0], dates[0]]
+    else:
+        processed[factor_name].columns = ["A", "A"]
+
+    with pytest.raises(
+        ValueError,
+        match=f"{factor_name} {axis} must be unique",
+    ):
+        compose(processed)
 
 
 def test_compose_equally_weights_cpv_subfactors_before_zscore():

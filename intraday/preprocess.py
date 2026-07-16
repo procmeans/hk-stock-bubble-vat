@@ -36,6 +36,13 @@ def neutralize_day(
     min_count: int = 400,
 ) -> pd.Series:
     """Winsorize, standardize, neutralize, and restandardize one day."""
+    for name, series in [
+        ("values", values),
+        ("float_cap", float_cap),
+        ("industry", industry),
+    ]:
+        if not series.index.is_unique:
+            raise ValueError(f"{name} index must be unique")
     frame = pd.concat(
         {"y": values, "cap": float_cap, "industry": industry},
         axis=1,
@@ -62,20 +69,29 @@ def neutralize_day(
         ],
         axis=1,
     )
-    beta = np.linalg.lstsq(
-        design.to_numpy(),
-        y.to_numpy(),
-        rcond=None,
-    )[0]
+    design_values = design.to_numpy()
+    y_values = y.to_numpy()
+    beta = np.linalg.lstsq(design_values, y_values, rcond=None)[0]
     if not np.isfinite(beta).all():
         return result
-    residual = pd.Series(
-        y.to_numpy() - design.to_numpy() @ beta,
-        index=frame.index,
+    residual_values = y_values - design_values @ beta
+    residual = pd.Series(residual_values, index=frame.index)
+    residual_norm = np.linalg.norm(residual_values, ord=2)
+    error_scale = (
+        np.linalg.norm(design_values, ord=2)
+        * np.linalg.norm(beta, ord=2)
+        + np.linalg.norm(y_values, ord=2)
+    )
+    backward_error = (
+        np.finfo(float).eps * max(design_values.shape) * error_scale
     )
     residual_std = residual.std(ddof=0)
-    numerical_zero = np.finfo(float).eps * max(design.shape)
-    if not np.isfinite(residual_std) or residual_std <= numerical_zero:
+    if (
+        not np.isfinite(residual_norm)
+        or residual_norm <= backward_error
+        or not np.isfinite(residual_std)
+        or residual_std == 0
+    ):
         return result
     result.loc[residual.index] = _zscore(residual)
     return result
@@ -199,6 +215,12 @@ def compose(processed: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     missing = [name for name in DIRECTIONS if name not in processed]
     if missing:
         raise ValueError(f"missing required factors: {', '.join(missing)}")
+
+    for name in DIRECTIONS:
+        if not processed[name].index.is_unique:
+            raise ValueError(f"{name} index must be unique")
+        if not processed[name].columns.is_unique:
+            raise ValueError(f"{name} columns must be unique")
 
     index = processed["rskew"].index
     columns = processed["rskew"].columns
