@@ -18,6 +18,8 @@ DEFAULT_WARMUP = "2025-12-11"
 DEFAULT_DAILY = Path("alpha101/cache/ths_panel.pkl")
 DEFAULT_CACHE = Path("intraday/cache")
 DEFAULT_OUTPUT = Path("output/intraday_6m")
+DEFAULT_REFRESH_MONTHS = 6
+DEFAULT_REFRESH_WARMUP_DAYS = 32
 PLAN_SCHEMA_VERSION = 2
 ATTRIBUTES_SCHEMA_VERSION = 1
 ADJUSTED_SCHEMA_VERSION = 1
@@ -29,19 +31,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command in ("prepare", "fetch", "validate", "all"):
-        item = subparsers.add_parser(command)
-        item.add_argument("--start", default=DEFAULT_START)
-        item.add_argument("--end", default=DEFAULT_END)
-        item.add_argument("--warmup", default=DEFAULT_WARMUP)
-        item.add_argument("--top", type=int, default=500)
-        item.add_argument("--daily-cache", type=Path, default=DEFAULT_DAILY)
-        item.add_argument("--cache", type=Path, default=DEFAULT_CACHE)
-        item.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-        item.add_argument("--top-n", type=int, default=50)
-        item.add_argument("--rebalance", type=int, default=5)
-        item.add_argument("--cost-bps", type=float, default=20.0)
-        item.add_argument("--min-count", type=int, default=400)
-        item.add_argument("--batch-size", type=int, default=200)
+        _add_common_args(subparsers.add_parser(command))
+    refresh = subparsers.add_parser("refresh")
+    _add_common_args(refresh)
+    refresh.add_argument("--data-dir", type=Path, default=Path("data"))
+    refresh.add_argument("--months", type=int, default=DEFAULT_REFRESH_MONTHS)
+    refresh.add_argument(
+        "--warmup-days", type=int, default=DEFAULT_REFRESH_WARMUP_DAYS
+    )
     return parser
 
 
@@ -49,6 +46,55 @@ def _positive_integer(value, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
+
+
+def _latest_snapshot_date(data_dir: Path) -> pd.Timestamp:
+    manifest = Path(data_dir) / "manifest_a.json"
+    if not manifest.is_file():
+        raise FileNotFoundError(f"missing A-share manifest: {manifest}")
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("A-share manifest is unreadable or corrupt") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("A-share manifest must be an object")
+    dates = payload.get("dates")
+    if not isinstance(dates, list) or not dates:
+        raise ValueError("A-share manifest must contain a non-empty dates list")
+    index = pd.DatetimeIndex(pd.to_datetime(dates, errors="coerce", format="mixed"))
+    if index.isna().any():
+        raise ValueError("A-share manifest contains invalid dates")
+    return index.max().normalize()
+
+
+def _refresh_window(data_dir: Path, months: int, warmup_days: int) -> tuple[str, str, str]:
+    if isinstance(months, bool) or not isinstance(months, int) or months <= 0:
+        raise ValueError("months must be a positive integer")
+    if isinstance(warmup_days, bool) or not isinstance(warmup_days, int) or warmup_days <= 0:
+        raise ValueError("warmup_days must be a positive integer")
+    end = _latest_snapshot_date(data_dir)
+    start = (end - pd.DateOffset(months=months)).normalize()
+    warmup = (start - pd.Timedelta(days=warmup_days)).normalize()
+    return (
+        warmup.strftime("%Y-%m-%d"),
+        start.strftime("%Y-%m-%d"),
+        end.strftime("%Y-%m-%d"),
+    )
+
+
+def _add_common_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--start", default=DEFAULT_START)
+    parser.add_argument("--end", default=DEFAULT_END)
+    parser.add_argument("--warmup", default=DEFAULT_WARMUP)
+    parser.add_argument("--top", type=int, default=500)
+    parser.add_argument("--daily-cache", type=Path, default=DEFAULT_DAILY)
+    parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--top-n", type=int, default=50)
+    parser.add_argument("--rebalance", type=int, default=5)
+    parser.add_argument("--cost-bps", type=float, default=20.0)
+    parser.add_argument("--min-count", type=int, default=400)
+    parser.add_argument("--batch-size", type=int, default=200)
 
 
 def _normalize_day(value, name: str) -> pd.Timestamp:
@@ -1439,12 +1485,28 @@ def run_validate(args):
     return report.write_outputs(results, args.output)
 
 
+def run_refresh(args):
+    warmup, start, end = _refresh_window(
+        args.data_dir, args.months, args.warmup_days
+    )
+    refresh_args = argparse.Namespace(**vars(args))
+    refresh_args.start = start
+    refresh_args.end = end
+    refresh_args.warmup = warmup
+    run_prepare(refresh_args)
+    run_fetch(refresh_args)
+    run_validate(refresh_args)
+
+
 def main(argv=None) -> None:
     args = build_parser().parse_args(argv)
     if args.command == "all":
         run_prepare(args)
         run_fetch(args)
         run_validate(args)
+        return
+    if args.command == "refresh":
+        run_refresh(args)
         return
     actions = {
         "prepare": run_prepare,

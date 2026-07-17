@@ -118,10 +118,11 @@ fetch_hk.py  港股:逐只并发(12 线程)抓取,~7 分钟
 
 网页为纯静态单页(D3 + Canvas),数据按需从 `data/` 加载,无需后端。
 
-分钟因子验证与模拟盘发布由 `.github/workflows/intraday-paper.yml` 负责:
+分钟因子验证与模拟盘发布由 `.github/workflows/intraday-paper.yml` 负责,
+它会按最新 `data/manifest_a.json` 里的交易日滚动六个月窗口:
 
 ```
-python -m intraday.run all
+python -m intraday.run refresh --data-dir data
 python -m intraday.paper publish --input output/intraday_6m --paper-dir paper
   → 写入 `output/intraday_6m/` 与 `paper/a_intraday_6m/`
   → 提交并推送(自动触发 GitHub Pages 重新部署)

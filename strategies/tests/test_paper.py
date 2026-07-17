@@ -1148,6 +1148,6 @@ def test_repository_has_two_attention_combo_accounts_and_eight_strategy_ui():
     assert "THS_HTTP_REFRESH_TOKEN" in workflow
     assert "run-market --market a" in workflow
     assert "git add paper/" in workflow
-    assert "python -m intraday.run all" in intraday_workflow
+    assert "python -m intraday.run refresh --data-dir data" in intraday_workflow
     assert "python -m intraday.paper publish" in intraday_workflow
     assert "intraday-paper.yml" in readme

@@ -2,7 +2,7 @@ name: intraday-paper
 
 on:
   schedule:
-    - cron: "30 13 * * 1-5"
+    - cron: "15 13-22 * * 1-5"
   workflow_dispatch: {}
 
 permissions:
@@ -30,7 +30,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Refresh intraday validation outputs
-        run: python -m intraday.run all
+        run: python -m intraday.run refresh --data-dir data
 
       - name: Publish intraday paper account
         run: python -m intraday.paper publish --input output/intraday_6m --paper-dir paper

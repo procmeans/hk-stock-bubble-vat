@@ -120,6 +120,55 @@ def test_parser_accepts_smaller_operational_fetch_batch():
     assert args.batch_size == 100
 
 
+def test_refresh_parser_defaults_are_pinned():
+    args = build_parser().parse_args(["refresh"])
+
+    assert args.data_dir == Path("data")
+    assert args.months == 6
+    assert args.warmup_days == 32
+    assert args.top == 500
+    assert args.top_n == 50
+    assert args.rebalance == 5
+    assert args.cost_bps == 20.0
+    assert args.min_count == 400
+    assert args.batch_size == 200
+
+
+def test_refresh_uses_latest_manifest_date(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "manifest_a.json").write_text(
+        json.dumps({"dates": ["2026-07-10", "2026-07-16"]}),
+        encoding="utf-8",
+    )
+    args = build_parser().parse_args(
+        [
+            "refresh",
+            "--data-dir",
+            str(data_dir),
+            "--cache",
+            str(tmp_path / "cache"),
+            "--output",
+            str(tmp_path / "output"),
+        ]
+    )
+    calls = []
+
+    def capture(name):
+        def _capture(namespace):
+            calls.append((name, namespace.start, namespace.end, namespace.warmup))
+        return _capture
+
+    monkeypatch.setattr(intraday_run, "run_prepare", capture("prepare"))
+    monkeypatch.setattr(intraday_run, "run_fetch", capture("fetch"))
+    monkeypatch.setattr(intraday_run, "run_validate", capture("validate"))
+
+    intraday_run.run_refresh(args)
+
+    expected = ("2026-01-16", "2026-07-16", "2025-12-15")
+    assert calls == [("prepare", *expected), ("fetch", *expected), ("validate", *expected)]
+
+
 def test_all_four_subcommands_share_identical_defaults():
     parsed = {
         command: vars(build_parser().parse_args([command]))
