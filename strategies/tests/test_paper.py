@@ -1091,10 +1091,10 @@ def test_append_attention_signals_is_idempotent(tmp_path, monkeypatch):
     assert len(pd.read_csv(tmp_path / "ths_attention_combo_signals.csv")) == 1
 
 
-def test_repository_has_two_attention_combo_accounts_and_seven_strategy_ui():
+def test_repository_has_two_attention_combo_accounts_and_eight_strategy_ui():
     root = paper.Path(__file__).resolve().parents[2]
     entries = json.loads((root / "paper" / "accounts.json").read_text())
-    assert len(entries) == 7
+    assert len(entries) == 8
     by_account = {entry["account"]: entry for entry in entries}
     expected = {
         "a_ths_attention_weighted": (
@@ -1102,6 +1102,9 @@ def test_repository_has_two_attention_combo_accounts_and_seven_strategy_ui():
         ),
         "a_ths_attention_funnel": (
             "A股 注意力逐层筛选", "ths_attention_funnel"
+        ),
+        "a_intraday_6m": (
+            "A股 分钟线量价因子", "intraday_factor"
         ),
     }
     for account, (title, strategy) in expected.items():
@@ -1111,10 +1114,17 @@ def test_repository_has_two_attention_combo_accounts_and_seven_strategy_ui():
         state = json.loads((root / "paper" / account / "state.json").read_text())
         assert state["capital"] == 100000.0
         assert state["strategy"] == strategy and state["market"] == "a"
-        assert state["params"] == {
-            "top_n": 20, "candidate_n": 100,
-            "rebalance": 2, "min_history": 60,
-        }
+        if account == "a_intraday_6m":
+            assert state["params"] == {
+                "top": 500, "top_n": 50,
+                "rebalance": 5, "cost_bps": 20.0,
+                "min_count": 400,
+            }
+        else:
+            assert state["params"] == {
+                "top_n": 20, "candidate_n": 100,
+                "rebalance": 2, "min_history": 60,
+            }
         nav = pd.read_csv(root / "paper" / account / "nav.csv")
         assert nav.columns.tolist() == [
             "date", "nav", "cash", "positions_value", "bench_nav",
@@ -1127,10 +1137,17 @@ def test_repository_has_two_attention_combo_accounts_and_seven_strategy_ui():
     assert audit.columns.tolist() == paper.ATTENTION_SIGNAL_COLUMNS
     html = (root / "paper.html").read_text()
     index = (root / "index.html").read_text()
-    assert "模拟盘 · 七策略" in html and "模拟盘 · 七策略 →" in index
+    assert "模拟盘 · 八策略" in html and "模拟盘 · 八策略 →" in index
     assert "a_ths_attention_weighted" in html
     assert "a_ths_attention_funnel" in html
+    assert "a_intraday_6m" in html
+    assert "output/intraday_6m/report.md" in html
     workflow = (root / ".github/workflows/paper-a.yml").read_text()
+    intraday_workflow = (root / ".github/workflows/intraday-paper.yml").read_text()
+    readme = (root / "README.md").read_text()
     assert "THS_HTTP_REFRESH_TOKEN" in workflow
     assert "run-market --market a" in workflow
     assert "git add paper/" in workflow
+    assert "python -m intraday.run all" in intraday_workflow
+    assert "python -m intraday.paper publish" in intraday_workflow
+    assert "intraday-paper.yml" in readme

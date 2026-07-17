@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>模拟盘 · 七策略</title>
+<title>模拟盘 · 八策略</title>
 <style>
   :root{
     --surface:#0a0e1a; --panel:#10182b; --ink:#e8eef7; --ink-2:#8da2c0;
@@ -56,6 +56,7 @@
     <p id="desc">虚拟资金 100,000 · 单边 20bp · T+1 收盘成交</p>
     <p class="nav"><a href="index.html">← 估值气泡缸</a> ·
       <a id="repolink" href="https://github.com/procmeans/hk-stock-bubble-vat/tree/main/paper">状态文件与订单流水</a></p>
+    <p class="nav"><a id="reportlink" href="output/intraday_6m/report.md">分钟因子验证报告</a></p>
     <div id="accts"></div>
   </header>
 
@@ -101,6 +102,8 @@ const DESC = {
     '每2交易日调仓 · 虚拟资金 ¥100,000 · 注:组合权重未经历史优化,仅做前向检验',
   a_ths_attention_funnel: '注意力上升前100 → 7日动量为正 → 低流通比例50% → top 20等权 · ' +
     '每2交易日调仓 · 虚拟资金 ¥100,000 · 注:硬门槛可能导致持仓不足20只',
+  a_intraday_6m: '分钟线量价因子(六个月验证转发) · top 50 · 每 5 交易日调仓 · ' +
+    '虚拟资金 ¥100,000 · 单边 20bp · 由 output/intraday_6m/report.md 同步发布',
 };
 
 function parseCSV(text) {
@@ -230,6 +233,7 @@ async function load(entry) {
     DESC[entry.account] || '虚拟资金 100,000 · 单边 20bp · T+1 收盘成交';
   document.getElementById('repolink').href =
     'https://github.com/procmeans/hk-stock-bubble-vat/tree/main/paper/' + entry.account;
+  document.getElementById('reportlink').href = 'output/intraday_6m/report.md';
   document.querySelectorAll('#accts button').forEach(b =>
     b.classList.toggle('on', b.dataset.account === entry.account));
   document.getElementById('tiles').innerHTML = '';

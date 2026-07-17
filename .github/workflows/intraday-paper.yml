@@ -1,0 +1,50 @@
+name: intraday-paper
+
+on:
+  schedule:
+    - cron: "30 13 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: intraday-paper
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      THS_HTTP_REFRESH_TOKEN: ${{ secrets.THS_HTTP_REFRESH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Refresh intraday validation outputs
+        run: python -m intraday.run all
+
+      - name: Publish intraday paper account
+        run: python -m intraday.paper publish --input output/intraday_6m --paper-dir paper
+
+      - name: Commit & push snapshot
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A output/intraday_6m paper/
+          if git diff --cached --quiet; then
+            echo "无变化,跳过提交"
+          else
+            git commit -m "paper: intraday publish $(date -u +%F)"
+            for i in 1 2 3 4 5; do
+              git pull --rebase origin main && git push && { echo "push 成功"; break; } || { echo "第 $i 次 push 冲突,重试"; sleep 5; }
+            done
+          fi

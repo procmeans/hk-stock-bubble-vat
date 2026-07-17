@@ -33,5 +33,10 @@
   "account": "a_ths_attention_funnel",
   "title": "A股 注意力逐层筛选",
   "currency": "¥"
+ },
+ {
+  "account": "a_intraday_6m",
+  "title": "A股 分钟线量价因子",
+  "currency": "¥"
  }
 ]
